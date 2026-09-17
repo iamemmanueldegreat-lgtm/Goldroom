@@ -7,6 +7,8 @@ import {
   fazerConfigured,
   matchOffer,
   razerCatalog,
+  createPayment,
+  getPayment,
 } from "./fazer.mjs";
 
 const TOKEN = (process.env.TELEGRAM_BOT_TOKEN || "").trim();
@@ -353,28 +355,97 @@ function parseDepositLabel(text) {
   return n > 0 ? n : null;
 }
 
-async function startDeposit(ctx, baseUsdt) {
-  if (!WALLET_BEP20) {
-    await ctx.reply("Pay-in wallet is not set yet.");
-    return;
+const watching = new Set();
+
+function paidStatus(st) {
+  return ["completed", "complete", "success", "paid", "confirmed"].includes(String(st || "").toLowerCase());
+}
+
+async function tryConfirmFromFazer(depositId) {
+  const d = desk.deposits.get(depositId);
+  if (!d) return "Not found";
+  if (d.status === "credited") return "Already credited";
+  if (d.status === "cancelled") return "Closed";
+  if (!fazerConfigured()) return d.status;
+  try {
+    const pay = await getPayment(d.id);
+    if (!pay) return d.status;
+    if (paidStatus(pay.status)) {
+      const credited = exactUsdt(pay.creditAmount) || d.payAmount;
+      if (credited) d.creditCents = centsOf(credited);
+      d.status = "checking";
+      return creditDeposit(depositId);
+    }
+    if (["cancelled", "canceled", "expired", "failed"].includes(pay.status)) {
+      d.status = "cancelled";
+      await save({ deposits: [d] });
+      return "cancelled";
+    }
+  } catch (err) {
+    console.error("payment poll failed", err instanceof Error ? err.message : err);
   }
+  return d.status;
+}
+
+async function watchPayment(depositId) {
+  if (watching.has(depositId)) return;
+  watching.add(depositId);
+  try {
+    const first = desk.deposits.get(depositId);
+    const until = (first?.expiresAt || Date.now()) + 10 * 60 * 1000;
+    while (Date.now() < until) {
+      const st = await tryConfirmFromFazer(depositId);
+      if (["Credited", "Already credited", "Closed", "cancelled", "Not found"].includes(st)) return;
+      await new Promise((r) => setTimeout(r, 8000));
+    }
+  } finally {
+    watching.delete(depositId);
+  }
+}
+
+async function startDeposit(ctx, baseUsdt) {
   const amount = exactUsdt(baseUsdt);
   if (!amount) {
-    await ctx.reply("Enter an amount in USDT, for example 24.8 or 1.");
+    await ctx.reply("Enter an amount in USDT, for example 24.8 or 10.");
+    return;
+  }
+  if (!fazerConfigured()) {
+    await ctx.reply("Deposits are paused for a moment. Please try again shortly.");
     return;
   }
   const user = ensureUser(ctx.chat.id, ctx.from?.username || String(ctx.from?.id));
+  await ctx.reply("Creating your deposit address…");
+  let pay;
+  try {
+    pay = await createPayment(amount, `dep-${ctx.chat.id}-${Date.now()}`);
+  } catch (err) {
+    if (err && err.code === "MIN") {
+      await ctx.reply(`Minimum deposit is ${Number(err.min).toFixed(2)} USDT.`);
+      return;
+    }
+    if (err && err.code === "MAX") {
+      await ctx.reply(`Maximum deposit is ${Number(err.max).toFixed(2)} USDT.`);
+      return;
+    }
+    console.error("create payment failed", err instanceof Error ? err.message : err);
+    await ctx.reply("Could not create a deposit right now. Please try again in a minute.");
+    await notifyAdmin(`Deposit create failed for @${user.username}: ${err instanceof Error ? err.message : err}`);
+    return;
+  }
+  const send = exactUsdt(pay.sendAmount) || amount;
+  const credit = exactUsdt(pay.creditAmount) || amount;
+  const exp = pay.expiresAt ? new Date(pay.expiresAt).getTime() : Date.now() + ORDER_TTL_MS;
   const deposit = {
-    id: nextId(),
+    id: pay.id,
     chatId: ctx.chat.id,
     username: user.username,
-    payAmount: amount,
+    payAmount: send,
     payAsset: "USDT",
-    address: WALLET_BEP20,
-    creditCents: centsOf(amount),
+    address: pay.address,
+    creditCents: centsOf(credit),
     status: /** @type {DepositStatus} */ ("awaiting"),
     createdAt: Date.now(),
-    expiresAt: Date.now() + ORDER_TTL_MS,
+    expiresAt: Number.isFinite(exp) ? exp : Date.now() + ORDER_TTL_MS,
   };
   desk.deposits.set(deposit.id, deposit);
   sessionOf(ctx.chat.id).screen = "pay";
@@ -384,19 +455,20 @@ async function startDeposit(ctx, baseUsdt) {
     .text("I’ve paid", `paid:${deposit.id}`)
     .row()
     .text("Cancel", `cancel:${deposit.id}`);
-  await ctx.reply(
-    [
-      `Send exactly ${amount} USDT`,
-      "Network: USDT · BEP20",
-      `Deposit: ${deposit.id}`,
-      "",
-      "To:",
-      `\`${WALLET_BEP20}\``,
-      "",
-      "Send this amount. Network fees on your wallet are paid by you.",
-    ].join("\n"),
-    { parse_mode: "Markdown", reply_markup: kb },
-  );
+  const lines = [
+    `Send exactly ${send} USDT`,
+    "Network: USDT · BEP20",
+    `Deposit: ${deposit.id}`,
+    "",
+    "To:",
+    `\`${pay.address}\``,
+  ];
+  if (pay.memo) {
+    lines.push("", `Memo: \`${pay.memo}\``);
+  }
+  lines.push("", "Send this amount. Network fees on your wallet are paid by you.", "Your balance updates automatically after confirmation.");
+  await ctx.reply(lines.join("\n"), { parse_mode: "Markdown", reply_markup: kb });
+  void watchPayment(deposit.id);
 }
 
 async function creditDeposit(depositId) {
@@ -744,29 +816,23 @@ if (bot) {
       await ctx.answerCallbackQuery({ text: "Not found" });
       return;
     }
-    if (d.status !== "awaiting") {
-      await ctx.answerCallbackQuery({ text: "Already moving" });
+    if (d.status === "credited") {
+      await ctx.answerCallbackQuery({ text: "Already credited" });
+      return;
+    }
+    if (d.status === "cancelled") {
+      await ctx.answerCallbackQuery({ text: "Closed" });
+      return;
+    }
+    await ctx.answerCallbackQuery({ text: "Checking…" });
+    const st = await tryConfirmFromFazer(id);
+    if (st === "Credited" || st === "Already credited") {
       return;
     }
     d.status = "checking";
     await save({ deposits: [d] });
-    await ctx.answerCallbackQuery();
-    await ctx.reply("Payment received. We're confirming it now. Your balance will update shortly.");
-    const kb = new InlineKeyboard()
-      .text("Credit balance", `credit:${d.id}`)
-      .row()
-      .text("Reject", `reject:${d.id}`);
-    await notifyAdmin(
-      [
-        "Deposit claimed — fund Fazer first",
-        `${d.id}  ·  ${d.payAmount} USDT BEP20`,
-        `@${d.username}  ·  id ${d.chatId}`,
-        "",
-        "1. Send USDT to FazerCards on BEP20.",
-        "2. When Fazer shows the balance, tap Credit.",
-      ].join("\n"),
-      { reply_markup: kb },
-    );
+    await ctx.reply("We're confirming it now. Your balance will update automatically.");
+    void watchPayment(id);
   });
 
   bot.callbackQuery(/^credit:(.+)$/, async (ctx) => {
@@ -833,7 +899,7 @@ if (bot) {
     if (text === "Deposit") {
       sess.screen = "deposit";
       await ctx.reply(
-        "Choose a deposit amount, or type one — for example 24.8 or 1.\n\nSend that exact USDT amount on BEP20. Network fees are paid from your wallet.",
+        "Choose a deposit amount, or type one — for example 24.8 or 10.\n\nSend that exact USDT amount on BEP20. Network fees are paid from your wallet. Your balance updates after confirmation.",
         { reply_markup: depositKb() },
       );
       return;
@@ -932,6 +998,9 @@ const server = http.createServer((req, res) => {
 server.listen(PORT, "0.0.0.0", async () => {
   console.log(`goldroom health listening on ${PORT}`);
   await loadDesk();
+  for (const d of desk.deposits.values()) {
+    if (d.status === "awaiting" || d.status === "checking") void watchPayment(d.id);
+  }
   if (!bot) return;
   bot.start({
     onStart: (info) => {

@@ -176,3 +176,73 @@ export async function buyRazerPin(denom, idem) {
     categoryId: cat.categoryId,
   };
 }
+
+export async function paymentMethods() {
+  const data = await fzr("/payments/methods");
+  return data.items || data.methods || [];
+}
+
+export async function bep20Limits() {
+  try {
+    const items = await paymentMethods();
+    const bep = items.find((m) => /bep20/i.test(`${m.code || ""} ${m.label || ""}`)) || items[0];
+    if (!bep) return { min: 10, max: 50000, code: "bep20" };
+    return {
+      code: bep.code || "bep20",
+      min: Number(bep.minAmountUsd ?? bep.min_amount ?? bep.min ?? 10) || 10,
+      max: Number(bep.maxAmountUsd ?? bep.max_amount ?? bep.max ?? 50000) || 50000,
+    };
+  } catch {
+    return { min: 10, max: 50000, code: "bep20" };
+  }
+}
+
+export function normalizePayment(raw) {
+  const p = raw?.payment || raw;
+  if (!p || typeof p !== "object") return null;
+  const amount = p.amount ?? p.credit_amount ?? p.usd;
+  const unique = p.uniqueAmount ?? p.unique_amount ?? p.send_amount;
+  return {
+    id: String(p.id || ""),
+    address: p.address || p.wallet || p.to || "",
+    sendAmount: String(unique || amount || ""),
+    creditAmount: String(amount || unique || ""),
+    status: String(p.status || "pending").toLowerCase(),
+    expiresAt: p.expiresAt || p.expires_at || null,
+    network: p.network || "BEP20",
+    memo: p.memo || p.tag || "",
+    raw: p,
+  };
+}
+
+export async function createPayment(amount, idem) {
+  const limits = await bep20Limits();
+  const n = Number(amount);
+  if (n < limits.min) {
+    const err = new Error(`MIN:${limits.min}`);
+    err.code = "MIN";
+    err.min = limits.min;
+    throw err;
+  }
+  if (n > limits.max) {
+    const err = new Error(`MAX:${limits.max}`);
+    err.code = "MAX";
+    err.max = limits.max;
+    throw err;
+  }
+  const data = await fzr("/payments/create", {
+    method: "POST",
+    body: { method: limits.code || "bep20", amount: n },
+    idem,
+  });
+  const pay = normalizePayment(data);
+  if (!pay?.id || !pay.address) {
+    throw new Error("Payment address was not returned");
+  }
+  return pay;
+}
+
+export async function getPayment(id) {
+  const data = await fzr(`/payments/${encodeURIComponent(id)}`);
+  return normalizePayment(data);
+}
