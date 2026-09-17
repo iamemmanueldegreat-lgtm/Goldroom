@@ -14,7 +14,7 @@ import { nid } from "./utils";
 import { getLiveWallets } from "./secrets";
 
 const ORDER_TTL_MS = 30 * 60 * 1000;
-const DEPOSITS = [20, 30, 50, 100, 200];
+const DEPOSITS = [10, 25, 50, 100, 200];
 
 type ShopState = {
   hydrated: boolean;
@@ -119,7 +119,7 @@ function welcomeMessage(): ChatMessage {
     from: "bot",
     at: 0,
     kind: "text",
-    text: "Goldroom\nPrivate desk for Razer Gold US.\n\n1. Deposit USDT on BEP20.\n2. Desk funds Fazer, then credits your balance.\n3. Buy a PIN with that balance.",
+    text: "Goldroom\nOfficial Razer Gold US gift cards.\n\nPay with USDT on BEP20. Your code is delivered in this chat.\n\nDeposit to add funds, then buy.",
     keyboard: homeKeyboard(),
   };
 }
@@ -298,7 +298,7 @@ export const useShop = create<ShopState>()(
               userMsg("Deposit"),
               botMsg({
                 kind: "text",
-                text: "Pick how much USDT to load.\nMatching cents are added so the desk can identify your payment.\n\nAfter it arrives, the desk funds Fazer, then credits your Goldroom balance.",
+                text: "Choose a deposit amount, or type one — for example 40 USDT.\n\nSend USDT on BEP20. Use the exact amount shown.",
                 keyboard: depositKeyboard(),
               }),
             ],
@@ -331,8 +331,8 @@ export const useShop = create<ShopState>()(
                 kind: "text",
                 text:
                   s.balanceCents <= 0
-                    ? "Balance is 0.00 USDT.\nDeposit first. After the desk funds Fazer, you can buy."
-                    : `Razer Gold · United States\nBalance: ${money(s.balanceCents)} USDT\n\nPick an amount you can afford. PIN comes from Fazer.`,
+                    ? "Your balance is 0.00 USDT. Deposit to continue."
+                    : `Razer Gold US\nBalance: ${money(s.balanceCents)} USDT\n\nChoose an amount.`,
                 keyboard: catalogKeyboard(s.balanceCents, s.settings.prices),
               }),
             ],
@@ -348,7 +348,7 @@ export const useShop = create<ShopState>()(
               userMsg("How it works"),
               botMsg({
                 kind: "text",
-                text: "1. Deposit USDT on BEP20 (exact amount).\n2. Desk sends that USDT to FazerCards.\n3. After Fazer is funded, your Goldroom balance is credited.\n4. Buy Razer Gold US up to your balance. PIN lands here.\n\nRedeem at gold.razer.com → Reload → Razer Gold PIN.",
+                text: "Buy Razer Gold US in three steps.\n\n1. Deposit USDT on BEP20 — send the exact amount shown.\n2. When your balance updates, tap Buy Razer Gold.\n3. Your PIN arrives in this chat.\n\nRedeem at gold.razer.com → Reload → Razer Gold PIN.\nCodes are final once revealed.",
                 keyboard: homeKeyboard(),
               }),
             ],
@@ -505,8 +505,8 @@ export const useShop = create<ShopState>()(
                 kind: "status",
                 orderId,
                 text: auto
-                  ? "Desk is funding Fazer, then your balance…"
-                  : "Payment flagged. The desk will fund Fazer, then credit your balance.",
+                  ? "Payment received. We're confirming it now…"
+                  : "Payment received. We're confirming it now. Your balance will update shortly.",
               }),
             ],
           }));
@@ -529,7 +529,7 @@ export const useShop = create<ShopState>()(
             ...s.messages,
             botMsg({
               kind: "text",
-              text: `Deposit ${orderId} credited.\nBalance: ${money(s.balanceCents + credit)} USDT\n\nYou can buy Razer Gold up to that amount.`,
+              text: `Deposit ${orderId} confirmed.\nBalance: ${money(s.balanceCents + credit)} USDT\n\nYou can buy Razer Gold US now.`,
               keyboard: homeKeyboard(),
             }),
           ],

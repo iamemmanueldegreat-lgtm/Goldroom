@@ -16,15 +16,14 @@ function Home() {
       <main className="mx-auto flex max-w-6xl flex-col-reverse gap-8 px-4 py-6 sm:px-6 lg:grid lg:grid-cols-[1fr_400px] lg:items-start lg:gap-16 lg:py-14">
         <section className="max-w-xl">
           <p className="text-xs font-medium uppercase tracking-[0.18em] text-brass">
-            Private desk
+            Official
           </p>
           <h1 className="mt-4 font-display text-[2.6rem] leading-[1.1] tracking-[-0.03em] text-fg sm:text-5xl">
             Razer Gold US, paid in crypto, delivered in chat.
           </h1>
           <p className="mt-5 text-base leading-relaxed text-muted">
-            Goldroom is a quiet shop for a small group. Deposit USDT on BEP20,
-            the desk funds Fazer, then you buy a Razer Gold US PIN from your
-            balance. Same flow as the Telegram bot.
+            Official Razer Gold US gift cards. Deposit USDT on BEP20, then buy
+            from your balance. Your PIN arrives in chat.
           </p>
 
           <ol className="mt-8 space-y-4">
@@ -32,12 +31,12 @@ function Home() {
               {
                 n: "01",
                 t: "Deposit USDT",
-                d: "Send the exact BEP20 amount. Matching cents identify the deposit.",
+                d: "Send the exact amount shown, USDT on BEP20.",
               },
               {
                 n: "02",
-                t: "Desk funds Fazer",
-                d: "After the supplier balance is up, your Goldroom balance is credited.",
+                t: "Balance updates",
+                d: "When your deposit is confirmed, your Goldroom balance is ready to spend.",
               },
               {
                 n: "03",

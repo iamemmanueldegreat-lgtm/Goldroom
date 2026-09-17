@@ -22,7 +22,7 @@ const PORT = Number(process.env.PORT || 3000);
 const ORDER_TTL_MS = 30 * 60 * 1000;
 const PRICES = { 10: 11.5, 20: 22.8, 25: 28.2, 50: 55.5, 100: 109 };
 const DENOMS = [10, 20, 25, 50, 100];
-const DEPOSITS = [20, 30, 50, 100, 200];
+const DEPOSITS = [10, 25, 50, 100, 200];
 
 /** @typedef {"awaiting" | "checking" | "credited" | "cancelled"} DepositStatus */
 /** @typedef {"pending" | "delivered" | "failed"} PurchaseStatus */
@@ -348,8 +348,7 @@ async function startDeposit(ctx, baseUsdt) {
       "To:",
       `\`${WALLET_BEP20}\``,
       "",
-      "BEP20 only. TRC20 or ERC20 will not land.",
-      "After it arrives, the desk funds Fazer, then credits your Goldroom balance.",
+      "Send the exact amount shown.",
     ].join("\n"),
     { parse_mode: "Markdown", reply_markup: kb },
   );
@@ -368,7 +367,7 @@ async function creditDeposit(depositId) {
   if (bot) {
     await bot.api.sendMessage(
       d.chatId,
-      `Deposit ${d.id} credited.\nBalance: ${money(user.balanceCents)} USDT\n\nYou can buy Razer Gold up to that amount.`,
+      `Deposit ${d.id} confirmed.\nBalance: ${money(user.balanceCents)} USDT\n\nYou can buy Razer Gold US now.`,
       { reply_markup: homeKb() },
     );
   }
@@ -380,14 +379,14 @@ async function buyCard(ctx, denom) {
   const need = retailCents(denom);
   if (user.balanceCents < need) {
     await ctx.reply(
-      `Need ${money(need)} USDT for $${denom}. You have ${money(user.balanceCents)}.\nDeposit first.`,
+      `$${denom} is ${money(need)} USDT. Your balance is ${money(user.balanceCents)} USDT.\nDeposit to continue.`,
       { reply_markup: depositKb() },
     );
     sessionOf(ctx.chat.id).screen = "deposit";
     return;
   }
   if (!fazerConfigured()) {
-    await ctx.reply("The supplier key is not on the desk yet. Deposit still works.");
+    await ctx.reply("Purchases are paused for a moment. Please try again shortly.");
     return;
   }
   user.balanceCents -= need;
@@ -401,7 +400,7 @@ async function buyCard(ctx, denom) {
   };
   desk.purchases.set(purchase.id, purchase);
   await save({ users: [user], purchases: [purchase] });
-  await ctx.reply(`Buying Razer Gold US · $${denom} from Fazer…`);
+  await ctx.reply(`Issuing Razer Gold US · $${denom}…`);
   try {
     const card = await buyRazerPin(denom, purchase.id);
     purchase.status = "delivered";
@@ -434,7 +433,7 @@ async function buyCard(ctx, denom) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error("fazer buy failed", msg);
     await ctx.reply(
-      `Could not pull $${denom} from Fazer yet. Your ${money(need)} USDT is back on the balance (${money(user.balanceCents)}).\n\nThe desk will fund Fazer and you can tap Buy again.`,
+      `This card is temporarily unavailable. Your ${money(need)} USDT is still on your balance (${money(user.balanceCents)}).\n\nPlease try again in a few minutes.`,
       { reply_markup: homeKb() },
     );
     await notifyAdmin(`Fazer buy failed for @${user.username} $${denom}\n${purchase.id}\n${msg}\n\nFund Fazer, then they can retry.`);
@@ -450,7 +449,7 @@ const bot = TOKEN ? new Bot(TOKEN) : null;
 if (bot) {
   bot.use(async (ctx, next) => {
     if (ctx.from && !allowed(ctx) && !isAdmin(ctx)) {
-      await ctx.reply("This desk is private.");
+      await ctx.reply("Goldroom is available to registered customers only.");
       return;
     }
     await next();
@@ -460,13 +459,13 @@ if (bot) {
     ensureUser(ctx.chat.id, ctx.from?.username || String(ctx.from?.id));
     await sendHome(
       ctx,
-      "Goldroom\nPrivate desk for Razer Gold US.\n\n1. Deposit USDT on BEP20.\n2. The desk funds Fazer, then credits your balance.\n3. Buy a PIN with that balance.\n\nTap Deposit to start.",
+      "Goldroom\nOfficial Razer Gold US gift cards.\n\nPay with USDT on BEP20. Your code is delivered in this chat.\n\nDeposit to add funds, then buy.",
     );
   });
 
   bot.command("help", async (ctx) => {
     await ctx.reply(
-      "How this desk works.\n\n1. Deposit USDT on BEP20 (exact amount with matching cents).\n2. The desk sends that USDT to FazerCards.\n3. After Fazer is funded, your Goldroom balance is credited.\n4. Buy Razer Gold US up to your balance. The PIN is pulled from Fazer and lands here.\n\nRedeem at gold.razer.com → Reload → Razer Gold PIN.\nNo refunds once a code is revealed.",
+      "Buy Razer Gold US in three steps.\n\n1. Deposit USDT on BEP20 — send the exact amount shown.\n2. When your balance updates, tap Buy Razer Gold.\n3. Your PIN arrives in this chat.\n\nRedeem at gold.razer.com → Reload → Razer Gold PIN.\nCodes are final once revealed.",
       { reply_markup: homeKb() },
     );
   });
@@ -535,7 +534,7 @@ if (bot) {
     try {
       await bot.api.sendMessage(
         chatId,
-        `The desk credited ${amount.toFixed(2)} USDT. Balance: ${money(user.balanceCents)} USDT.`,
+        `Your account has been credited ${amount.toFixed(2)} USDT. Balance: ${money(user.balanceCents)} USDT.`,
         { reply_markup: homeKb() },
       );
     } catch {
@@ -576,7 +575,7 @@ if (bot) {
     d.status = "checking";
     await save({ deposits: [d] });
     await ctx.answerCallbackQuery();
-    await ctx.reply("Payment flagged. The desk will fund Fazer, then credit your balance.");
+    await ctx.reply("Payment received. We're confirming it now. Your balance will update shortly.");
     const kb = new InlineKeyboard()
       .text("Credit balance", `credit:${d.id}`)
       .row()
@@ -658,7 +657,7 @@ if (bot) {
     if (text === "Deposit") {
       sess.screen = "deposit";
       await ctx.reply(
-        "Pick how much USDT to load.\n\nYou can also type an amount, like 40 USDT.\nMatching cents are added so the desk can identify your payment.",
+        "Choose a deposit amount, or type one — for example 40 USDT.\n\nSend USDT on BEP20. Use the exact amount shown.",
         { reply_markup: depositKb() },
       );
       return;
@@ -667,8 +666,8 @@ if (bot) {
       sess.screen = "catalog";
       const body =
         user.balanceCents <= 0
-          ? "Balance is 0.00 USDT.\nDeposit first. After the desk funds Fazer, you can buy."
-          : `Razer Gold · United States\nBalance: ${money(user.balanceCents)} USDT\n\nPINs come from Fazer after you pick an amount you can afford.`;
+          ? "Your balance is 0.00 USDT. Deposit to continue."
+          : `Razer Gold US\nBalance: ${money(user.balanceCents)} USDT\n\nChoose an amount.`;
       await ctx.reply(body, { reply_markup: catalogKb(user.balanceCents) });
       return;
     }
@@ -680,7 +679,7 @@ if (bot) {
     }
     if (text === "Help") {
       await ctx.reply(
-        "1. Deposit USDT on BEP20.\n2. Desk funds Fazer, then credits you.\n3. Buy Razer Gold US with that balance.\n4. PIN arrives in this chat.\n\nBEP20 only — not TRC20, not ERC20.",
+        "1. Deposit USDT on BEP20 — send the exact amount shown.\n2. When your balance updates, tap Buy Razer Gold.\n3. Your PIN arrives in this chat.\n\nRedeem at gold.razer.com.",
         { reply_markup: homeKb() },
       );
       return;

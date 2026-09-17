@@ -9,7 +9,7 @@ export const NETWORK_META: Record<
     label: "USDT",
     asset: "USDT",
     chain: "BEP20",
-    hint: "BNB Smart Chain · USDT only on this chain",
+    hint: "USDT on BEP20",
   },
   btc: {
     label: "Bitcoin",
@@ -30,7 +30,7 @@ export const DEFAULT_PRICES: PriceRow[] = [
 export const DEFAULT_SETTINGS: Settings = {
   shopName: "Goldroom",
   botName: "Goldroom",
-  markupNote: "Price includes the desk fee. Nothing extra at payment.",
+  markupNote: "Price is final. Nothing extra at checkout.",
   prices: DEFAULT_PRICES,
   wallets: {
     "usdt-bep20": "0x00000000000000000000000000000000d0000001",

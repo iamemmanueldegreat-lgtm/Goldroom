@@ -44,7 +44,7 @@ export function ChatPhone() {
             </div>
             <div className="min-w-0 flex-1">
               <p className="truncate text-sm font-medium leading-tight">Goldroom</p>
-              <p className="text-xs text-muted">bot · private desk</p>
+              <p className="text-xs text-muted">Official Razer Gold US</p>
             </div>
             <span className="rounded-full bg-ok/15 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-ok">
               Live demo
@@ -190,8 +190,7 @@ function PayCard({ order }: { order: Order }) {
       <Row label="To" value={shortAddr(order.address, 10, 8)} copy={order.address} />
       <CopyRow label="Amount" value={order.payAmount} />
       <p className="pt-1 text-[11px] leading-snug text-subtle">
-        BEP20 USDT only. TRC20 or ERC20 will not land. Send the exact amount —
-        matching cents identify this order.
+        Send USDT on BEP20. Use the exact amount shown.
       </p>
     </div>
   );
@@ -207,8 +206,7 @@ function PinCard({ order }: { order: Order }) {
       <CopyRow label="PIN" value={prettyPin(order.pin)} raw={order.pin} />
       {order.serial && <CopyRow label="Serial" value={order.serial} />}
       <p className="pt-1 text-[11px] leading-snug text-subtle">
-        Demo PIN — not redeemable. Live desk pulls a real Razer code from Fazer
-        after your Goldroom balance is credited.
+        Demo PIN — not redeemable. Live shop delivers a real Razer Gold US code.
       </p>
     </div>
   );

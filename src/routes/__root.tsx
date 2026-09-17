@@ -14,7 +14,7 @@ export const Route = createRootRoute({
       { title: APP_NAME },
       {
         name: "description",
-        content: "Private Razer Gold US desk. Pay in crypto, PIN in chat.",
+        content: "Official Razer Gold US gift cards. Pay with USDT on BEP20.",
       },
       { name: "theme-color", content: "#0c0b0a" },
     ],
