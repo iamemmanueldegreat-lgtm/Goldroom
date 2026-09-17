@@ -1,0 +1,2 @@
+[start]
+cmd = "node bot/server.mjs"

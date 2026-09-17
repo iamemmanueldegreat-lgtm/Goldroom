@@ -1,0 +1,130 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@theme {
+  --font-sans: "Outfit", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Instrument Serif", ui-serif, Georgia, serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", monospace;
+
+  --color-bg: #0c0b0a;
+  --color-bg-elevated: #141312;
+  --color-bg-subtle: #1c1a18;
+  --color-fg: #f2efe8;
+  --color-muted: #9a958c;
+  --color-subtle: #6f6b64;
+  --color-border: rgb(242 239 232 / 0.1);
+  --color-border-strong: rgb(242 239 232 / 0.18);
+  --color-accent: #ece7dc;
+  --color-accent-fg: #12110f;
+  --color-brass: #c4a574;
+  --color-ok: #8fbf9a;
+  --color-warn: #d4b483;
+  --color-danger: #d9897a;
+  --color-chat: #0e0d0c;
+  --color-bubble-bot: #1a1917;
+  --color-bubble-user: #2c2924;
+
+  --radius-xs: 4px;
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 24px;
+  --radius-2xl: 32px;
+
+  --shadow-border: 0 0 0 1px rgb(242 239 232 / 0.08);
+
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-smooth-out: cubic-bezier(0.22, 1, 0.36, 1);
+
+  --motion-stagger: 40ms;
+  --motion-micro: 80ms;
+  --motion-quick: 150ms;
+  --motion-fast: 250ms;
+  --motion-medium: 350ms;
+  --motion-slow: 400ms;
+}
+
+@layer base {
+  html {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    background: var(--color-bg);
+    color: var(--color-fg);
+  }
+
+  body {
+    font-family: var(--font-sans);
+    background: var(--color-bg);
+    color: var(--color-fg);
+  }
+
+  h1,
+  h2,
+  h3 {
+    text-wrap: balance;
+  }
+
+  p {
+    text-wrap: pretty;
+  }
+
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+
+  ::selection {
+    background: var(--color-brass);
+    color: var(--color-accent-fg);
+  }
+}
+
+@keyframes goldroom-rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+    filter: blur(2px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+    filter: blur(0);
+  }
+}
+
+@keyframes goldroom-shimmer {
+  0% {
+    background-position: 100% 0;
+  }
+  100% {
+    background-position: -100% 0;
+  }
+}
+
+.msg-enter {
+  animation: goldroom-rise var(--motion-fast) var(--ease-smooth-out) both;
+}
+
+.shimmer-text {
+  background: linear-gradient(
+    90deg,
+    var(--color-muted) 40%,
+    var(--color-fg) 50%,
+    var(--color-muted) 60%
+  );
+  background-size: 200% 100%;
+  background-clip: text;
+  color: transparent;
+  animation: goldroom-shimmer 1.6s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .msg-enter,
+  .shimmer-text {
+    animation: none;
+  }
+  .shimmer-text {
+    color: var(--color-muted);
+    background: none;
+  }
+}

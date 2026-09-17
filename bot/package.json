@@ -1,0 +1,11 @@
+{
+  "name": "goldroom-bot",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "grammy": "^1.46.0"
+  }
+}
