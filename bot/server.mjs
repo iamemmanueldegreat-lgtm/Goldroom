@@ -25,6 +25,10 @@ const ORDER_TTL_MS = 30 * 60 * 1000;
 const DEFAULT_PRICES = { 10: 11.5, 20: 22.8, 25: 28.2, 50: 55.5, 100: 109 };
 const DENOMS = [10, 20, 25, 50, 100];
 const DEPOSITS = [10, 25, 50, 100, 200];
+const PAY_NETWORKS = [
+  { code: "bep20", label: "USDT · BEP20", chain: "BEP20" },
+  { code: "aptos", label: "USDT · Aptos", chain: "Aptos" },
+];
 
 /** @typedef {"awaiting" | "checking" | "credited" | "cancelled"} DepositStatus */
 /** @typedef {"pending" | "delivered" | "failed"} PurchaseStatus */
@@ -46,7 +50,7 @@ const desk = {
   deposits: new Map(),
   /** @type {Map<string, {id: string, chatId: number, denom: number, retailCents: number, costUsd?: string, fazerOrderId?: string, pin?: string, serial?: string, status: PurchaseStatus, createdAt: number}>} */
   purchases: new Map(),
-  /** @type {Map<number, {screen: string, denom?: number, depositId?: string}>} */
+  /** @type {Map<number, {screen: string, denom?: number, depositId?: string, depositAmount?: string}>} */
   sessions: new Map(),
 };
 
@@ -273,6 +277,37 @@ function depositKb() {
   return kb.resized();
 }
 
+function networkKb() {
+  return new Keyboard()
+    .text("USDT · BEP20")
+    .row()
+    .text("USDT · Aptos")
+    .row()
+    .text("Back")
+    .resized();
+}
+
+function networkMeta(code) {
+  return PAY_NETWORKS.find((n) => n.code === code) || PAY_NETWORKS[0];
+}
+
+function parseNetwork(text) {
+  const t = String(text || "").trim().toLowerCase().replace(/·/g, " ").replace(/\s+/g, " ");
+  if (t === "usdt bep20" || t === "bep20") return "bep20";
+  if (t === "usdt aptos" || t === "aptos") return "aptos";
+  return null;
+}
+
+async function askNetwork(ctx, amount) {
+  const sess = sessionOf(ctx.chat.id);
+  sess.screen = "network";
+  sess.depositAmount = amount;
+  await ctx.reply(
+    `${amount} USDT\n\nChoose a network.`,
+    { reply_markup: networkKb() },
+  );
+}
+
 function catalogKb(balanceCents) {
   const kb = new Keyboard();
   for (const d of DENOMS) {
@@ -403,7 +438,7 @@ async function watchPayment(depositId) {
   }
 }
 
-async function startDeposit(ctx, baseUsdt) {
+async function startDeposit(ctx, baseUsdt, method = "bep20") {
   const amount = exactUsdt(baseUsdt);
   if (!amount) {
     await ctx.reply("Enter an amount in USDT, for example 24.8 or 10.");
@@ -417,7 +452,7 @@ async function startDeposit(ctx, baseUsdt) {
   await ctx.reply("Creating your deposit address…");
   let pay;
   try {
-    pay = await createPayment(amount, `dep-${ctx.chat.id}-${Date.now()}`);
+    pay = await createPayment(amount, `dep-${ctx.chat.id}-${Date.now()}`, method);
   } catch (err) {
     if (err && err.code === "MIN") {
       await ctx.reply(`Minimum deposit is ${Number(err.min).toFixed(2)} USDT.`);
@@ -457,7 +492,7 @@ async function startDeposit(ctx, baseUsdt) {
     .text("Cancel", `cancel:${deposit.id}`);
   const lines = [
     `Send exactly ${send} USDT`,
-    "Network: USDT · BEP20",
+    `Network: ${networkMeta(method).label}`,
     `Deposit: ${deposit.id}`,
     "",
     "To:",
@@ -605,13 +640,13 @@ if (bot) {
     ensureUser(ctx.chat.id, ctx.from?.username || String(ctx.from?.id));
     await sendHome(
       ctx,
-      "Goldroom\nOfficial Razer Gold US gift cards.\n\nPay with USDT on BEP20. Your code is delivered in this chat.\n\nDeposit to add funds, then buy.",
+      "Goldroom\nOfficial Razer Gold US gift cards.\n\nPay with USDT on BEP20 or Aptos. Your code is delivered in this chat.\n\nDeposit to add funds, then buy.",
     );
   });
 
   bot.command("help", async (ctx) => {
     await ctx.reply(
-      "Buy Razer Gold US in three steps.\n\n1. Deposit USDT on BEP20 — send the exact amount shown.\n2. When your balance updates, tap Buy Razer Gold.\n3. Your PIN arrives in this chat.\n\nRedeem at gold.razer.com → Reload → Razer Gold PIN.\nCodes are final once revealed.",
+      "Buy Razer Gold US in three steps.\n\n1. Deposit USDT on BEP20 or Aptos — send the exact amount shown.\n2. When your balance updates, tap Buy Razer Gold.\n3. Your PIN arrives in this chat.\n\nRedeem at gold.razer.com → Reload → Razer Gold PIN.\nCodes are final once revealed.",
       { reply_markup: homeKb() },
     );
   });
@@ -899,7 +934,7 @@ if (bot) {
     if (text === "Deposit") {
       sess.screen = "deposit";
       await ctx.reply(
-        "Choose a deposit amount, or type one — for example 24.8 or 10.\n\nSend that exact USDT amount on BEP20. Network fees are paid from your wallet. Your balance updates after confirmation.",
+        "Choose a deposit amount, or type one — for example 24.8 or 10.\n\nThen pick BEP20 or Aptos. Network fees are paid from your wallet. Your balance updates after confirmation.",
         { reply_markup: depositKb() },
       );
       return;
@@ -921,7 +956,7 @@ if (bot) {
     }
     if (text === "Help") {
       await ctx.reply(
-        "1. Deposit USDT on BEP20 — send the exact amount shown.\n2. When your balance updates, tap Buy Razer Gold.\n3. Your PIN arrives in this chat.\n\nRedeem at gold.razer.com.",
+        "1. Deposit USDT on BEP20 or Aptos — send the exact amount shown.\n2. When your balance updates, tap Buy Razer Gold.\n3. Your PIN arrives in this chat.\n\nRedeem at gold.razer.com.",
         { reply_markup: homeKb() },
       );
       return;
@@ -946,14 +981,36 @@ if (bot) {
       return;
     }
     if (text === "Back" || text === "Menu") {
+      if (sess.screen === "network") {
+        sess.screen = "deposit";
+        await ctx.reply("Choose a deposit amount.", { reply_markup: depositKb() });
+        return;
+      }
       await sendHome(ctx, "What do you need?");
+      return;
+    }
+
+    const net = parseNetwork(text);
+    if (net) {
+      const amt = sess.depositAmount;
+      if (!amt) {
+        sess.screen = "deposit";
+        await ctx.reply("Choose a deposit amount first.", { reply_markup: depositKb() });
+        return;
+      }
+      await startDeposit(ctx, amt, net);
       return;
     }
 
     const dep = parseDepositLabel(text);
     const typed = /^\d+(?:\.\d{1,8})?$/.test(text) ? Number(text) : NaN;
     if (dep != null || (Number.isFinite(typed) && typed > 0)) {
-      await startDeposit(ctx, dep ?? typed);
+      const amount = exactUsdt(dep ?? typed);
+      if (!amount) {
+        await ctx.reply("Enter an amount in USDT, for example 24.8 or 10.");
+        return;
+      }
+      await askNetwork(ctx, amount);
       return;
     }
 

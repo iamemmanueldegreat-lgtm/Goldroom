@@ -182,19 +182,26 @@ export async function paymentMethods() {
   return data.items || data.methods || [];
 }
 
-export async function bep20Limits() {
+export async function methodLimits(code = "bep20") {
+  const want = String(code || "bep20").toLowerCase();
   try {
     const items = await paymentMethods();
-    const bep = items.find((m) => /bep20/i.test(`${m.code || ""} ${m.label || ""}`)) || items[0];
-    if (!bep) return { min: 10, max: 50000, code: "bep20" };
+    const hit =
+      items.find((m) => String(m.code || "").toLowerCase() === want) ||
+      items.find((m) => new RegExp(want, "i").test(`${m.code || ""} ${m.label || ""}`));
+    if (!hit) return { min: 10, max: 50000, code: want };
     return {
-      code: bep.code || "bep20",
-      min: Number(bep.minAmountUsd ?? bep.min_amount ?? bep.min ?? 10) || 10,
-      max: Number(bep.maxAmountUsd ?? bep.max_amount ?? bep.max ?? 50000) || 50000,
+      code: hit.code || want,
+      min: Number(hit.minAmountUsd ?? hit.min_amount ?? hit.min ?? 10) || 10,
+      max: Number(hit.maxAmountUsd ?? hit.max_amount ?? hit.max ?? 50000) || 50000,
     };
   } catch {
-    return { min: 10, max: 50000, code: "bep20" };
+    return { min: 10, max: 50000, code: want };
   }
+}
+
+export async function bep20Limits() {
+  return methodLimits("bep20");
 }
 
 export function normalizePayment(raw) {
@@ -215,8 +222,8 @@ export function normalizePayment(raw) {
   };
 }
 
-export async function createPayment(amount, idem) {
-  const limits = await bep20Limits();
+export async function createPayment(amount, idem, method = "bep20") {
+  const limits = await methodLimits(method);
   const n = Number(amount);
   if (n < limits.min) {
     const err = new Error(`MIN:${limits.min}`);
@@ -232,7 +239,7 @@ export async function createPayment(amount, idem) {
   }
   const data = await fzr("/payments/create", {
     method: "POST",
-    body: { method: limits.code || "bep20", amount: n },
+    body: { method: limits.code || method, amount: n },
     idem,
   });
   const pay = normalizePayment(data);
