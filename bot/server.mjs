@@ -1,5 +1,5 @@
 import http from "node:http";
-import { Bot, InlineKeyboard, Keyboard } from "grammy";
+import { Bot, InlineKeyboard, Keyboard, InputFile } from "grammy";
 import { createClient } from "@supabase/supabase-js";
 import {
   buyRazerPin,
@@ -308,6 +308,23 @@ function prettyPin(pin) {
   return String(pin).replace(/(\d{4})(?=\d)/g, "$1 ").trim();
 }
 
+function pinFile(denom, orderId, pin, serial) {
+  const lines = [
+    "Goldroom",
+    `Razer Gold US · $${denom}`,
+    `Order ${orderId}`,
+    "",
+    "PIN",
+    String(pin).trim(),
+    "",
+  ];
+  if (serial) {
+    lines.push("Serial", String(serial).trim(), "");
+  }
+  lines.push("Redeem at gold.razer.com", "Reload → Razer Gold PIN", "");
+  return Buffer.from(lines.join("\n"), "utf8");
+}
+
 async function sendHome(ctx, text) {
   sessionOf(ctx.chat.id).screen = "home";
   await ctx.reply(text, { reply_markup: homeKb() });
@@ -464,8 +481,22 @@ async function buyCard(ctx, denom) {
         "",
         "Redeem at gold.razer.com → Reload → Razer Gold PIN.",
       ].join("\n"),
-      { parse_mode: "Markdown", reply_markup: homeKb() },
+            { parse_mode: "Markdown", reply_markup: homeKb() },
     );
+    try {
+      await ctx.replyWithDocument(
+        new InputFile(
+          pinFile(denom, purchase.id, card.pin, card.serial),
+          `Goldroom-RazerGold-USD${denom}.txt`,
+        ),
+        {
+          caption:
+            "Download and keep this file. Screenshot the message above if you want a picture.",
+        },
+      );
+    } catch (fileErr) {
+      console.error("pin file send failed", fileErr instanceof Error ? fileErr.message : fileErr);
+    }
     await notifyAdmin(
       `Sold $${denom} to @${user.username}\n${purchase.id}\nFazer ${card.orderId || ""} · cost ${card.costUsd || "?"} USD`,
     );

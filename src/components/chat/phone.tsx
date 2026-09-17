@@ -198,6 +198,20 @@ function PayCard({ order }: { order: Order }) {
 
 function PinCard({ order }: { order: Order }) {
   if (!order.pin) return null;
+  const file = [
+    "Goldroom",
+    `Razer Gold US${order.denom ? ` · $${order.denom}` : ""}`,
+    `Order ${order.id}`,
+    "",
+    "PIN",
+    order.pin,
+    "",
+    order.serial ? `Serial\n${order.serial}\n` : "",
+    "Redeem at gold.razer.com",
+    "Reload → Razer Gold PIN",
+    "",
+  ].join("\n");
+  const href = `data:text/plain;charset=utf-8,${encodeURIComponent(file)}`;
   return (
     <div className="mt-3 space-y-2 rounded-md bg-bg-elevated p-3 shadow-[var(--shadow-border)]">
       <p className="text-[11px] uppercase tracking-wider text-brass">
@@ -205,6 +219,13 @@ function PinCard({ order }: { order: Order }) {
       </p>
       <CopyRow label="PIN" value={prettyPin(order.pin)} raw={order.pin} />
       {order.serial && <CopyRow label="Serial" value={order.serial} />}
+      <a
+        href={href}
+        download={`Goldroom-RazerGold-USD${order.denom || "PIN"}.txt`}
+        className="mt-1 inline-flex h-9 items-center text-xs font-medium text-brass"
+      >
+        Download .txt
+      </a>
       <p className="pt-1 text-[11px] leading-snug text-subtle">
         Demo PIN — not redeemable. Live shop delivers a real Razer Gold US code.
       </p>
