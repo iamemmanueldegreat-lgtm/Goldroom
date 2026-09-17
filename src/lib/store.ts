@@ -428,7 +428,7 @@ export const useShop = create<ShopState>()(
                 userMsg(`$${denom}`),
                 botMsg({
                   kind: "text",
-                  text: `Need ${money(need)} USDT for $${denom}. You have ${money(s.balanceCents)}.\nDeposit first.`,
+                  text: `$${denom} is ${money(need)} USDT. Your balance is ${money(s.balanceCents)} USDT.\nDeposit to continue.`,
                   keyboard: depositKeyboard(),
                 }),
               ],
