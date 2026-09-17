@@ -20,7 +20,7 @@ const ALLOWLIST = (process.env.ALLOWLIST || "")
   .filter(Boolean);
 const PORT = Number(process.env.PORT || 3000);
 const ORDER_TTL_MS = 30 * 60 * 1000;
-const PRICES = { 10: 11.5, 20: 22.8, 25: 28.2, 50: 55.5, 100: 109 };
+const DEFAULT_PRICES = { 10: 11.5, 20: 22.8, 25: 28.2, 50: 55.5, 100: 109 };
 const DENOMS = [10, 20, 25, 50, 100];
 const DEPOSITS = [10, 25, 50, 100, 200];
 
@@ -37,6 +37,7 @@ const db =
 const desk = {
   seq: 1,
   ready: !db,
+  prices: { ...DEFAULT_PRICES },
   /** @type {Map<number, {chatId: number, username: string, balanceCents: number}>} */
   users: new Map(),
   /** @type {Map<string, {id: string, chatId: number, username: string, payAmount: string, payAsset: string, address: string, creditCents: number, status: DepositStatus, createdAt: number, expiresAt: number, creditedAt?: number}>} */
@@ -72,7 +73,7 @@ function centsOf(amount) {
 }
 
 function retailCents(denom) {
-  return Math.round(PRICES[denom] * 100);
+  return Math.round(desk.prices[denom] * 100);
 }
 
 function sessionOf(chatId) {
@@ -151,6 +152,21 @@ async function save({ users = [], deposits = [], purchases = [] } = {}) {
   }
 }
 
+async function savePrices() {
+  if (!db) return;
+  try {
+    const rows = DENOMS.map((d) => ({ key: `price_${d}`, value: retailCents(d) }));
+    const { error } = await db.from("goldroom_meta").upsert(rows);
+    if (error) throw error;
+  } catch (err) {
+    console.error("supabase save prices failed", err.message || err);
+  }
+}
+
+function priceBoard() {
+  return DENOMS.map((d) => `$${d}  ·  ${desk.prices[d].toFixed(2)} USDT`).join("\n");
+}
+
 async function loadDesk() {
   if (!db) {
     console.warn("Supabase missing — memory only");
@@ -161,7 +177,7 @@ async function loadDesk() {
       db.from("goldroom_users").select("*"),
       db.from("goldroom_deposits").select("*"),
       db.from("goldroom_purchases").select("*"),
-      db.from("goldroom_meta").select("value").eq("key", "seq").maybeSingle(),
+      db.from("goldroom_meta").select("*"),
     ]);
     if (users.error) throw users.error;
     if (deposits.error) throw deposits.error;
@@ -212,7 +228,15 @@ async function loadDesk() {
         },
       ]),
     );
-    desk.seq = Number(meta.data?.value) || 1;
+    desk.seq = 1;
+    desk.prices = { ...DEFAULT_PRICES };
+    for (const r of meta.data || []) {
+      if (r.key === "seq") desk.seq = Number(r.value) || 1;
+      if (String(r.key).startsWith("price_")) {
+        const d = Number(String(r.key).slice(6));
+        if (DENOMS.includes(d) && Number(r.value) > 0) desk.prices[d] = Number(r.value) / 100;
+      }
+    }
     desk.ready = true;
     console.log(
       `supabase loaded ${desk.users.size} users, ${desk.deposits.size} deposits, ${desk.purchases.size} purchases`,
@@ -484,6 +508,87 @@ if (bot) {
     await ctx.reply(`Goldroom balance: ${money(user.balanceCents)} USDT${extra}`, {
       reply_markup: homeKb(),
     });
+  });
+
+  bot.command("admin", async (ctx) => {
+    if (!isAdmin(ctx)) {
+      await ctx.reply("Not for buyers.");
+      return;
+    }
+    const pending = [...desk.deposits.values()].filter(
+      (d) => d.status === "awaiting" || d.status === "checking",
+    ).length;
+    const cards = [...desk.purchases.values()].filter((p) => p.status === "delivered").length;
+    let supplier = "not set";
+    if (fazerConfigured()) {
+      try {
+        const f = await fazerBalance();
+        supplier = `${f.balance} ${f.currency}`;
+      } catch (err) {
+        supplier = err.message || String(err);
+      }
+    }
+    await ctx.reply(
+      [
+        "Goldroom admin",
+        "",
+        `Customers: ${desk.users.size}`,
+        `Pending deposits: ${pending}`,
+        `Cards issued: ${cards}`,
+        `Supplier balance: ${supplier}`,
+        "",
+        "Prices",
+        priceBoard(),
+        "",
+        "/prices — list",
+        "/price 25 29.50 — set sell price",
+        "/users — customer balances",
+        "/credit 123456789 25 — add USDT",
+        "/catalog — supplier offers",
+      ].join("\n"),
+    );
+  });
+
+  bot.command("prices", async (ctx) => {
+    if (!isAdmin(ctx)) {
+      await ctx.reply("Not for buyers.");
+      return;
+    }
+    await ctx.reply(`Sell prices (USDT)\n${priceBoard()}\n\nChange with:\n/price 25 29.50`);
+  });
+
+  bot.command("price", async (ctx) => {
+    if (!isAdmin(ctx)) {
+      await ctx.reply("Not for buyers.");
+      return;
+    }
+    const parts = (ctx.match || "").trim().split(/\s+/);
+    const denom = Number(parts[0]);
+    const usdt = Number(parts[1]);
+    if (!DENOMS.includes(denom) || !Number.isFinite(usdt) || usdt <= 0) {
+      await ctx.reply(`Usage: /price 25 29.50\nAmounts: ${DENOMS.map((d) => "$" + d).join(", ")}`);
+      return;
+    }
+    desk.prices[denom] = Math.round(usdt * 100) / 100;
+    await savePrices();
+    await ctx.reply(`$${denom} now sells for ${desk.prices[denom].toFixed(2)} USDT.\n\n${priceBoard()}`);
+  });
+
+  bot.command("users", async (ctx) => {
+    if (!isAdmin(ctx)) {
+      await ctx.reply("Not for buyers.");
+      return;
+    }
+    const list = [...desk.users.values()].sort((a, b) => b.balanceCents - a.balanceCents);
+    if (!list.length) {
+      await ctx.reply("No customers yet.");
+      return;
+    }
+    const lines = list
+      .slice(0, 20)
+      .map((u) => `${u.chatId}  ·  @${u.username || "—"}  ·  ${money(u.balanceCents)} USDT`)
+      .join("\n");
+    await ctx.reply(`Customers\n${lines}`);
   });
 
   bot.command("catalog", async (ctx) => {
