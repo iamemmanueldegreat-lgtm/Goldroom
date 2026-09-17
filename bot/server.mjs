@@ -398,6 +398,21 @@ async function creditDeposit(depositId) {
   return "Credited";
 }
 
+async function offerCard(ctx, denom) {
+  const user = ensureUser(ctx.chat.id, ctx.from?.username || String(ctx.from?.id));
+  const need = retailCents(denom);
+  sessionOf(ctx.chat.id).screen = "confirm";
+  sessionOf(ctx.chat.id).denom = denom;
+  const kb = new InlineKeyboard()
+    .text(`Pay ${money(need)} USDT`, `buy:${denom}`)
+    .row()
+    .text("Cancel", "buyx");
+  await ctx.reply(
+    `Razer Gold US · $${denom}\n${money(need)} USDT\nBalance: ${money(user.balanceCents)} USDT`,
+    { reply_markup: kb },
+  );
+}
+
 async function buyCard(ctx, denom) {
   const user = ensureUser(ctx.chat.id, ctx.from?.username || String(ctx.from?.id));
   const need = retailCents(denom);
@@ -562,7 +577,8 @@ if (bot) {
       await ctx.reply("Not for buyers.");
       return;
     }
-    const parts = (ctx.match || "").trim().split(/\s+/);
+    const raw = (ctx.match || "").replace(/[$,=]/g, " ").replace(/usdt/gi, " ");
+    const parts = raw.trim().split(/\s+/);
     const denom = Number(parts[0]);
     const usdt = Number(parts[1]);
     if (!DENOMS.includes(denom) || !Number.isFinite(usdt) || usdt <= 0) {
@@ -571,7 +587,11 @@ if (bot) {
     }
     desk.prices[denom] = Math.round(usdt * 100) / 100;
     await savePrices();
-    await ctx.reply(`$${denom} now sells for ${desk.prices[denom].toFixed(2)} USDT.\n\n${priceBoard()}`);
+    const user = ensureUser(ctx.chat.id, ctx.from?.username || "");
+    await ctx.reply(
+      `$${denom} now sells for ${desk.prices[denom].toFixed(2)} USDT.\nThis is what buyers pay.\n\n${priceBoard()}`,
+      { reply_markup: catalogKb(user.balanceCents) },
+    );
   });
 
   bot.command("users", async (ctx) => {
@@ -664,6 +684,22 @@ if (bot) {
       ...mineBuy.map((p) => `${p.id}  ·  $${p.denom}  ·  ${p.status}`),
     ].join("\n");
     await ctx.reply(lines, { reply_markup: homeKb() });
+  });
+
+  bot.callbackQuery(/^buy:(\d+)$/, async (ctx) => {
+    const denom = Number(ctx.match[1]);
+    if (!DENOMS.includes(denom)) {
+      await ctx.answerCallbackQuery({ text: "Unknown amount" });
+      return;
+    }
+    await ctx.answerCallbackQuery();
+    await buyCard(ctx, denom);
+  });
+
+  bot.callbackQuery("buyx", async (ctx) => {
+    await ctx.answerCallbackQuery({ text: "Cancelled" });
+    const user = ensureUser(ctx.chat.id, ctx.from?.username || "");
+    await ctx.reply("Choose an amount.", { reply_markup: catalogKb(user.balanceCents) });
   });
 
   bot.callbackQuery(/^paid:(.+)$/, async (ctx) => {
@@ -821,7 +857,7 @@ if (bot) {
 
     const denom = parseDenomLabel(text);
     if (denom) {
-      await buyCard(ctx, denom);
+      await offerCard(ctx, denom);
       return;
     }
 
