@@ -1,10 +1,13 @@
 import http from "node:http";
 import { Bot, InlineKeyboard, Keyboard } from "grammy";
+import { createClient } from "@supabase/supabase-js";
 
 const TOKEN = (process.env.TELEGRAM_BOT_TOKEN || "").trim();
 const WALLET_BEP20 = (process.env.WALLET_USDT_BEP20 || "").trim();
 const WALLET_BTC = (process.env.WALLET_BTC || "").trim();
 const ADMIN_ID = Number((process.env.ADMIN_TELEGRAM_ID || "").trim()) || 0;
+const SUPABASE_URL = (process.env.SUPABASE_URL || "").trim();
+const SUPABASE_KEY = (process.env.SUPABASE_SERVICE_ROLE_KEY || "").trim();
 const ALLOWLIST = (process.env.ALLOWLIST || "")
   .split(/[,\s]+/)
   .map((s) => s.replace(/^@/, "").toLowerCase())
@@ -17,11 +20,19 @@ const DENOMS = [10, 20, 25, 50, 100];
 /** @typedef {"stock" | "reserved" | "sold"} PinStatus */
 /** @typedef {"awaiting" | "checking" | "delivered" | "cancelled"} OrderStatus */
 
+const db =
+  SUPABASE_URL && SUPABASE_KEY
+    ? createClient(SUPABASE_URL, SUPABASE_KEY, {
+        auth: { persistSession: false, autoRefreshToken: false },
+      })
+    : null;
+
 const desk = {
   seq: 1,
+  ready: !db,
   /** @type {Array<{id: string, denom: number, pin: string, serial: string, status: PinStatus, orderId?: string}>} */
   pins: [],
-  /** @type {Map<string, {id: string, chatId: number, username: string, denom: number, network: string, payAmount: string, payAsset: string, address: string, status: OrderStatus, pinId?: string, createdAt: number, expiresAt: number}>} */
+  /** @type {Map<string, {id: string, chatId: number, username: string, denom: number, network: string, payAmount: string, payAsset: string, address: string, status: OrderStatus, pinId?: string, createdAt: number, expiresAt: number, deliveredAt?: number}>} */
   orders: new Map(),
   /** @type {Map<number, {screen: string, denom?: number, orderId?: string}>} */
   sessions: new Map(),
@@ -54,6 +65,107 @@ function stockCount(denom) {
 function sessionOf(chatId) {
   if (!desk.sessions.has(chatId)) desk.sessions.set(chatId, { screen: "home" });
   return desk.sessions.get(chatId);
+}
+
+function pinRow(p) {
+  return {
+    id: p.id,
+    denom: p.denom,
+    pin: p.pin,
+    serial: p.serial,
+    status: p.status,
+    order_id: p.orderId || null,
+  };
+}
+
+function orderRow(o) {
+  return {
+    id: o.id,
+    chat_id: o.chatId,
+    username: o.username,
+    denom: o.denom,
+    network: o.network,
+    pay_amount: o.payAmount,
+    pay_asset: o.payAsset,
+    address: o.address,
+    status: o.status,
+    pin_id: o.pinId || null,
+    created_at: new Date(o.createdAt).toISOString(),
+    expires_at: new Date(o.expiresAt).toISOString(),
+    delivered_at: o.deliveredAt ? new Date(o.deliveredAt).toISOString() : null,
+  };
+}
+
+async function save(pins = [], orders = []) {
+  if (!db) return;
+  try {
+    if (pins.length) {
+      const { error } = await db.from("goldroom_pins").upsert(pins.map(pinRow));
+      if (error) throw error;
+    }
+    if (orders.length) {
+      const { error } = await db.from("goldroom_orders").upsert(orders.map(orderRow));
+      if (error) throw error;
+    }
+    const { error } = await db.from("goldroom_meta").upsert({ key: "seq", value: desk.seq });
+    if (error) throw error;
+  } catch (err) {
+    console.error("supabase save failed", err.message || err);
+  }
+}
+
+async function loadDesk() {
+  if (!db) {
+    console.warn("SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY missing — memory only");
+    return false;
+  }
+  try {
+    const pinsRes = await db.from("goldroom_pins").select("*");
+    if (pinsRes.error) throw pinsRes.error;
+    const ordersRes = await db.from("goldroom_orders").select("*");
+    if (ordersRes.error) throw ordersRes.error;
+    const metaRes = await db.from("goldroom_meta").select("value").eq("key", "seq").maybeSingle();
+    if (metaRes.error) throw metaRes.error;
+
+    desk.pins = (pinsRes.data || []).map((r) => ({
+      id: r.id,
+      denom: r.denom,
+      pin: r.pin,
+      serial: r.serial,
+      status: r.status,
+      orderId: r.order_id || undefined,
+    }));
+    desk.orders = new Map(
+      (ordersRes.data || []).map((r) => [
+        r.id,
+        {
+          id: r.id,
+          chatId: Number(r.chat_id),
+          username: r.username || "",
+          denom: r.denom,
+          network: r.network,
+          payAmount: r.pay_amount,
+          payAsset: r.pay_asset,
+          address: r.address,
+          status: r.status,
+          pinId: r.pin_id || undefined,
+          createdAt: new Date(r.created_at).getTime(),
+          expiresAt: new Date(r.expires_at).getTime(),
+          deliveredAt: r.delivered_at ? new Date(r.delivered_at).getTime() : undefined,
+        },
+      ]),
+    );
+    desk.seq = Number(metaRes.data?.value) || 1;
+    desk.ready = true;
+    console.log(`supabase loaded ${desk.pins.length} pins, ${desk.orders.size} orders, seq ${desk.seq}`);
+    return true;
+  } catch (err) {
+    console.error(
+      "supabase load failed — run bot/schema.sql in the Supabase SQL editor:",
+      err.message || err,
+    );
+    return false;
+  }
 }
 
 function homeKb() {
@@ -89,15 +201,23 @@ function isAdmin(ctx) {
   return ADMIN_ID > 0 && ctx.from?.id === ADMIN_ID;
 }
 
-function expireStale() {
+async function expireStale() {
   const now = Date.now();
+  const pins = [];
+  const orders = [];
   for (const order of desk.orders.values()) {
     if (order.status === "awaiting" && order.expiresAt < now) {
       order.status = "cancelled";
+      orders.push(order);
       const pin = desk.pins.find((p) => p.id === order.pinId);
-      if (pin && pin.status === "reserved") pin.status = "stock";
+      if (pin && pin.status === "reserved") {
+        pin.status = "stock";
+        pin.orderId = undefined;
+        pins.push(pin);
+      }
     }
   }
+  if (pins.length || orders.length) await save(pins, orders);
 }
 
 function prettyPin(pin) {
@@ -110,7 +230,7 @@ async function sendHome(ctx, text) {
 }
 
 async function sendCatalog(ctx, intro) {
-  expireStale();
+  await expireStale();
   sessionOf(ctx.chat.id).screen = "catalog";
   const left = stockCount();
   const body =
@@ -182,6 +302,7 @@ if (bot) {
     const rows = body.split(/\n+/).map((l) => l.trim()).filter(Boolean);
     let added = 0;
     const errors = [];
+    const fresh = [];
     for (const line of rows) {
       const parts = line.split(/[,\s|]+/).filter(Boolean);
       const denom = Number(parts[0]);
@@ -191,15 +312,18 @@ if (bot) {
         errors.push(line);
         continue;
       }
-      desk.pins.push({
+      const row = {
         id: nid("pin"),
         denom,
         pin,
         serial,
-        status: "stock",
-      });
+        status: /** @type {PinStatus} */ ("stock"),
+      };
+      desk.pins.push(row);
+      fresh.push(row);
       added += 1;
     }
+    if (fresh.length) await save(fresh, []);
     await ctx.reply(
       added ? `Added ${added} PIN${added === 1 ? "" : "s"}.` : "Nothing added.",
     );
@@ -241,7 +365,11 @@ if (bot) {
     }
     order.status = "cancelled";
     const pin = desk.pins.find((p) => p.id === order.pinId);
-    if (pin) pin.status = "stock";
+    if (pin) {
+      pin.status = "stock";
+      pin.orderId = undefined;
+    }
+    await save(pin ? [pin] : [], [order]);
     await ctx.answerCallbackQuery({ text: "Rejected" });
     await bot.api.sendMessage(order.chatId, `${orderId} was not confirmed. Nothing was sent.`, {
       reply_markup: homeKb(),
@@ -268,8 +396,12 @@ if (bot) {
     }
     order.status = "cancelled";
     const pin = desk.pins.find((p) => p.id === order.pinId);
-    if (pin) pin.status = "stock";
+    if (pin) {
+      pin.status = "stock";
+      pin.orderId = undefined;
+    }
     sessionOf(ctx.chat.id).screen = "home";
+    await save(pin ? [pin] : [], [order]);
     await ctx.answerCallbackQuery({ text: "Cancelled" });
     await ctx.reply(`${orderId} cancelled. Nothing was sent.`, { reply_markup: homeKb() });
   });
@@ -278,7 +410,7 @@ if (bot) {
     const text = ctx.message.text.trim();
     if (text.startsWith("/")) return;
 
-    expireStale();
+    await expireStale();
 
     if (text === "Buy Razer Gold" || text === "Amounts") {
       await sendCatalog(ctx);
@@ -369,6 +501,7 @@ if (bot) {
       desk.orders.set(order.id, order);
       sess.screen = "pay";
       sess.orderId = order.id;
+      await save([pin], [order]);
 
       const payKb = new InlineKeyboard()
         .text("I’ve paid", `paid:${order.id}`)
@@ -413,6 +546,7 @@ async function markPaid(ctx, orderId) {
     return;
   }
   order.status = "checking";
+  await save([], [order]);
   const payKb = new InlineKeyboard()
     .text("Confirm + send PIN", `confirm:${order.id}`)
     .row()
@@ -440,7 +574,9 @@ async function deliverOrder(ctx, orderId) {
   const pin = desk.pins.find((p) => p.id === order.pinId);
   if (!pin) return "No PIN";
   order.status = "delivered";
+  order.deliveredAt = Date.now();
   pin.status = "sold";
+  await save([pin], [order]);
   await bot.api.sendMessage(
     order.chatId,
     [
@@ -472,6 +608,9 @@ const server = http.createServer((req, res) => {
         bot: Boolean(TOKEN),
         wallet: Boolean(WALLET_BEP20),
         admin: Boolean(ADMIN_ID),
+        supabase: Boolean(db),
+        ready: desk.ready,
+        stock: desk.pins.filter((p) => p.status === "stock").length,
       }),
     );
     return;
@@ -480,16 +619,16 @@ const server = http.createServer((req, res) => {
   res.end("not found");
 });
 
-server.listen(PORT, "0.0.0.0", () => {
+server.listen(PORT, "0.0.0.0", async () => {
   console.log(`goldroom health listening on ${PORT}`);
-});
-
-if (bot) {
+  await loadDesk();
+  if (!bot) return;
   bot.start({
     onStart: (info) => {
       console.log(`goldroom bot @${info.username} polling`);
       if (!WALLET_BEP20) console.warn("WALLET_USDT_BEP20 is not set");
       if (!ADMIN_ID) console.warn("ADMIN_TELEGRAM_ID is not set — payments cannot be confirmed");
+      if (!db) console.warn("Supabase is not set — stock dies on restart");
     },
   });
-}
+});
