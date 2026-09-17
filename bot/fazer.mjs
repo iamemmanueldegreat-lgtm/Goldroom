@@ -33,19 +33,66 @@ async function fzr(path, { method = "GET", body, idem } = {}) {
 
 function codesFrom(order) {
   if (!order || typeof order !== "object") return [];
-  const bags = [order.cards, order.codes, order.keys, order.payload?.cards, order.payload?.codes];
+  const bags = [
+    order.cards,
+    order.codes,
+    order.keys,
+    order.items,
+    order.vouchers,
+    order.pins,
+    order.payload?.cards,
+    order.payload?.codes,
+    order.payload?.items,
+    order.payload?.pins,
+    order.data?.cards,
+    order.data?.codes,
+    order.order?.cards,
+    order.order?.codes,
+  ];
   const out = [];
+  const push = (v) => {
+    if (typeof v === "string" && v.trim()) out.push(v.trim());
+  };
   for (const bag of bags) {
     if (!Array.isArray(bag)) continue;
     for (const item of bag) {
-      if (typeof item === "string" && item.trim()) out.push(item.trim());
+      if (typeof item === "string") push(item);
       else if (item && typeof item === "object") {
-        const v = item.pin || item.code || item.card || item.serial || item.value;
-        if (typeof v === "string" && v.trim()) out.push(v.trim());
+        push(item.pin || item.code || item.card || item.serial || item.value || item.number || item.pin_code);
       }
     }
   }
-  return out;
+  push(order.pin);
+  push(order.code);
+  push(order.card);
+  push(order.pin_code);
+  push(order.payload?.pin);
+  push(order.payload?.code);
+  return [...new Set(out)];
+}
+
+export function extractCodes(order) {
+  return codesFrom(order);
+}
+
+export function matchOffer(offers, denom) {
+  const list = Array.isArray(offers) ? offers : [];
+  const n = Number(denom);
+  const scored = list.map((o) => {
+    const name = `${o.name || ""} ${o.title || ""} ${o.card_id || ""} ${o.sku || ""}`;
+    let score = 0;
+    if (new RegExp(`\\$${n}\\b`).test(name)) score += 8;
+    if (new RegExp(`(?:^|\\s)${n}(?:\\s|USD|usd|$)`).test(name)) score += 5;
+    if (new RegExp(`(?:^|[^0-9])${n}(?:\\.00)?(?:[^0-9]|$)`).test(name) && /us|usd|united/i.test(name)) score += 4;
+    const face = Number(o.face_value || o.amount || o.value || o.face || o.denomination);
+    if (face === n) score += 10;
+    const usd = Number(o.price_usd || o.price);
+    if (usd && Math.abs(usd - n) < 0.05) score += 3;
+    if (String(o.card_id || "").includes(String(n))) score += 2;
+    return { o, score };
+  });
+  scored.sort((a, b) => b.score - a.score);
+  return scored[0]?.score ? scored[0].o : null;
 }
 
 export async function fazerBalance() {
@@ -89,19 +136,9 @@ function pickCategory(hits) {
   return scored[0]?.id || "";
 }
 
-export function matchOffer(offers, denom) {
-  const list = Array.isArray(offers) ? offers : [];
-  const exact = list.find((o) => {
-    const name = `${o.name || ""} ${o.card_id || ""}`;
-    return new RegExp(`\\$${denom}\\b`).test(name) || new RegExp(`(?:^|\\s)${denom}(?:\\s|$)`).test(name);
-  });
-  if (exact) return exact;
-  return list.find((o) => String(o.face_value || o.amount || o.value) === String(denom)) || null;
-}
-
-export async function razerCatalog() {
+export async function razerCatalog(force = false) {
   const now = Date.now();
-  if (now - cache.at < 45_000 && cache.offers.length && cache.categoryId) return cache;
+  if (!force && now - cache.at < 45_000 && cache.offers.length && cache.categoryId) return cache;
   const hits = await listGiftcardHits();
   const categoryId = pickCategory(hits);
   if (!categoryId) {
@@ -118,32 +155,64 @@ export async function razerCatalog() {
   return cache;
 }
 
-async function waitOrder(id, ms = 90_000) {
+export async function getOrder(id) {
+  try {
+    const data = await fzr(`/orders/${encodeURIComponent(id)}`);
+    return data.order || data;
+  } catch {
+    const data = await fzr(`/giftcards/order/${encodeURIComponent(id)}`);
+    return data.order || data;
+  }
+}
+
+function failedStatus(st) {
+  return ["failed", "fail", "refund", "refunded", "cancelled", "canceled", "error"].includes(String(st || "").toLowerCase());
+}
+
+async function waitOrder(id, ms = 180_000) {
   const start = Date.now();
   let last = null;
   while (Date.now() - start < ms) {
-    const data = await fzr(`/orders/${encodeURIComponent(id)}`);
-    last = data.order || data;
-    const st = String(last.status || "").toLowerCase();
-    if (["completed", "complete", "success", "delivered"].includes(st)) return last;
-    if (["failed", "fail", "refund", "refunded", "cancelled", "canceled", "error"].includes(st)) {
-      throw new Error(`Fazer order ${st}`);
-    }
+    last = await getOrder(id);
     if (codesFrom(last).length) return last;
-    await new Promise((r) => setTimeout(r, 2500));
+    const st = String(last?.status || "").toLowerCase();
+    if (failedStatus(st)) {
+      const err = new Error(`ORDER_FAILED:${st}`);
+      err.code = "FAILED";
+      err.orderId = id;
+      throw err;
+    }
+    await new Promise((r) => setTimeout(r, 3000));
   }
   if (last && codesFrom(last).length) return last;
-  throw new Error("Fazer order timed out — balance was not taken twice, refund the buyer in Goldroom if needed");
+  const err = new Error("PROCESSING");
+  err.code = "PROCESSING";
+  err.orderId = id;
+  err.charged = true;
+  throw err;
 }
 
 export async function buyRazerPin(denom, idem) {
-  const cat = await razerCatalog();
-  if (!cat.categoryId) {
-    throw new Error("No Razer Gold category on Fazer. Set FAZER_CATEGORY_ID.");
-  }
-  const offer = matchOffer(cat.offers, denom);
+  let cat = await razerCatalog();
+  let offer = matchOffer(cat.offers, denom);
   if (!offer) {
-    throw new Error(`Fazer has no $${denom} Razer Gold offer right now.`);
+    cat = await razerCatalog(true);
+    offer = matchOffer(cat.offers, denom);
+  }
+  if (!cat.categoryId) {
+    const err = new Error("NO_CATEGORY");
+    err.code = "NO_OFFER";
+    throw err;
+  }
+  if (!offer) {
+    const err = new Error(`NO_OFFER:$${denom}`);
+    err.code = "NO_OFFER";
+    throw err;
+  }
+  if (offer.stock === 0 || offer.available === 0) {
+    const err = new Error("OUT_OF_STOCK");
+    err.code = "NO_OFFER";
+    throw err;
   }
   const created = await fzr("/giftcards/order", {
     method: "POST",
@@ -155,12 +224,22 @@ export async function buyRazerPin(denom, idem) {
     idem,
   });
   let order = created.order || created;
-  if (!codesFrom(order).length && order.id) {
-    order = await waitOrder(order.id);
+  const orderId = order.id;
+  if (!codesFrom(order).length && orderId) {
+    order = await waitOrder(orderId);
   }
   const codes = codesFrom(order);
   if (!codes.length) {
-    throw new Error("Fazer completed without a PIN. Check the Fazer dashboard.");
+    if (orderId) {
+      const err = new Error("PROCESSING");
+      err.code = "PROCESSING";
+      err.orderId = orderId;
+      err.charged = true;
+      throw err;
+    }
+    const err = new Error("NO_PIN");
+    err.code = "NO_OFFER";
+    throw err;
   }
   const serial =
     order.serial ||

@@ -9,6 +9,8 @@ import {
   razerCatalog,
   createPayment,
   getPayment,
+  getOrder,
+  extractCodes,
 } from "./fazer.mjs";
 
 const TOKEN = (process.env.TELEGRAM_BOT_TOKEN || "").trim();
@@ -529,6 +531,13 @@ async function creditDeposit(depositId) {
 async function offerCard(ctx, denom) {
   const user = ensureUser(ctx.chat.id, ctx.from?.username || String(ctx.from?.id));
   const need = retailCents(denom);
+  if (pendingBuy(ctx.chat.id)) {
+    await ctx.reply(
+      "Your last order is still processing. The PIN will be sent here. Please wait — do not buy again.",
+      { reply_markup: homeKb() },
+    );
+    return;
+  }
   sessionOf(ctx.chat.id).screen = "confirm";
   sessionOf(ctx.chat.id).denom = denom;
   const kb = new InlineKeyboard()
@@ -541,25 +550,175 @@ async function offerCard(ctx, denom) {
   );
 }
 
+const buying = new Set();
+const watchingBuys = new Set();
+
+function pendingBuy(chatId) {
+  return [...desk.purchases.values()].find(
+    (p) => p.chatId === chatId && p.status === "pending",
+  );
+}
+
+async function sendPinMessages(chatId, purchase, pin, serial) {
+  const user = ensureUser(chatId, "");
+  const body = [
+    "Your PIN is below — keep this message.",
+    "",
+    `Razer Gold US · $${purchase.denom}`,
+    `PIN: \`${prettyPin(pin)}\``,
+    serial ? `Serial: \`${serial}\`` : "",
+    "",
+    `Spent ${money(purchase.retailCents)} USDT. Balance: ${money(user.balanceCents)} USDT`,
+    "",
+    "Redeem at gold.razer.com → Reload → Razer Gold PIN.",
+  ].filter((l, i, a) => !(l === "" && a[i - 1] === "")).join("\n");
+  if (!bot) return;
+  await bot.api.sendMessage(chatId, body, { parse_mode: "Markdown", reply_markup: homeKb() });
+  try {
+    await bot.api.sendDocument(
+      chatId,
+      new InputFile(pinFile(purchase.denom, purchase.id, pin, serial), `Goldroom-RazerGold-USD${purchase.denom}.txt`),
+      { caption: "Download and keep this file. Screenshot the message above if you want a picture." },
+    );
+  } catch (fileErr) {
+    console.error("pin file send failed", fileErr instanceof Error ? fileErr.message : fileErr);
+  }
+}
+
+async function finishPurchase(purchase, pin, serial, costUsd, orderId) {
+  purchase.status = "delivered";
+  purchase.pin = pin;
+  purchase.serial = serial;
+  purchase.fazerOrderId = orderId || purchase.fazerOrderId;
+  purchase.costUsd = costUsd || purchase.costUsd;
+  await save({ purchases: [purchase] });
+  await sendPinMessages(purchase.chatId, purchase, pin, serial);
+  const user = desk.users.get(purchase.chatId);
+  await notifyAdmin(
+    `Sold $${purchase.denom} to @${user?.username || purchase.chatId}\n${purchase.id}\nFazer ${purchase.fazerOrderId || ""} · cost ${purchase.costUsd || "?"} USD`,
+  );
+}
+
+async function refundPurchase(purchase, reason) {
+  if (purchase.status === "failed" || purchase.status === "delivered") return;
+  const user = ensureUser(purchase.chatId, "");
+  user.balanceCents += purchase.retailCents;
+  purchase.status = "failed";
+  await save({ users: [user], purchases: [purchase] });
+  if (bot) {
+    await bot.api.sendMessage(
+      purchase.chatId,
+      `This card is temporarily unavailable. Your ${money(purchase.retailCents)} USDT is back on your balance (${money(user.balanceCents)}).`,
+      { reply_markup: homeKb() },
+    );
+  }
+  await notifyAdmin(`Buy refunded ${purchase.id} @${user.username} $${purchase.denom}\n${reason}`);
+}
+
+async function watchPurchase(purchaseId) {
+  if (watchingBuys.has(purchaseId)) return;
+  watchingBuys.add(purchaseId);
+  try {
+    const until = Date.now() + 12 * 60 * 1000;
+    while (Date.now() < until) {
+      const purchase = desk.purchases.get(purchaseId);
+      if (!purchase || purchase.status !== "pending") return;
+      if (!purchase.fazerOrderId) {
+        await new Promise((r) => setTimeout(r, 4000));
+        continue;
+      }
+      try {
+        const order = await getOrder(purchase.fazerOrderId);
+        const codes = extractCodes(order);
+        const st = String(order?.status || "").toLowerCase();
+        if (codes.length) {
+          const serial =
+            order.serial ||
+            order.payload?.serial ||
+            (typeof order.cards?.[0] === "object" ? order.cards[0].serial : "") ||
+            purchase.fazerOrderId;
+          await finishPurchase(purchase, codes[0], serial, purchase.costUsd, purchase.fazerOrderId);
+          return;
+        }
+        if (["failed", "fail", "refund", "refunded", "cancelled", "canceled", "error"].includes(st)) {
+          await refundPurchase(purchase, `supplier ${st}`);
+          return;
+        }
+      } catch (err) {
+        console.error("watch purchase", err instanceof Error ? err.message : err);
+      }
+      await new Promise((r) => setTimeout(r, 4000));
+    }
+    const stuck = desk.purchases.get(purchaseId);
+    if (stuck && stuck.status === "pending") {
+      await notifyAdmin(
+        `PIN still processing ${stuck.id} $${stuck.denom} chat ${stuck.chatId}\nFazer ${stuck.fazerOrderId || "?"}\nDo not refund unless Fazer failed.`,
+      );
+      if (bot) {
+        await bot.api.sendMessage(
+          stuck.chatId,
+          "Your order is still being issued. Keep this chat open — the PIN will arrive here. Do not pay again.",
+          { reply_markup: homeKb() },
+        );
+      }
+    }
+  } finally {
+    watchingBuys.delete(purchaseId);
+  }
+}
+
 async function buyCard(ctx, denom) {
-  const user = ensureUser(ctx.chat.id, ctx.from?.username || String(ctx.from?.id));
+  const chatId = ctx.chat.id;
+  const user = ensureUser(chatId, ctx.from?.username || String(ctx.from?.id));
   const need = retailCents(denom);
+
+  const open = pendingBuy(chatId);
+  if (open) {
+    await ctx.reply(
+      "Your last order is still processing. The PIN will be sent here. Please wait — do not buy again.",
+      { reply_markup: homeKb() },
+    );
+    void watchPurchase(open.id);
+    return;
+  }
+  if (buying.has(chatId)) {
+    await ctx.reply("Please wait, your order is already being placed.");
+    return;
+  }
   if (user.balanceCents < need) {
     await ctx.reply(
       `$${denom} is ${money(need)} USDT. Your balance is ${money(user.balanceCents)} USDT.\nDeposit to continue.`,
       { reply_markup: depositKb() },
     );
-    sessionOf(ctx.chat.id).screen = "deposit";
+    sessionOf(chatId).screen = "deposit";
     return;
   }
   if (!fazerConfigured()) {
     await ctx.reply("Purchases are paused for a moment. Please try again shortly.");
     return;
   }
+  try {
+    const cat = await razerCatalog();
+    if (!matchOffer(cat.offers, denom)) {
+      const fresh = await razerCatalog(true);
+      if (!matchOffer(fresh.offers, denom)) {
+        await ctx.reply("This amount is not available right now. Try another amount.", {
+          reply_markup: catalogKb(user.balanceCents),
+        });
+        return;
+      }
+    }
+  } catch (err) {
+    console.error("catalog precheck", err instanceof Error ? err.message : err);
+    await ctx.reply("Purchases are paused for a moment. Please try again shortly.");
+    return;
+  }
+
+  buying.add(chatId);
   user.balanceCents -= need;
   const purchase = {
     id: nextId(),
-    chatId: ctx.chat.id,
+    chatId,
     denom,
     retailCents: need,
     status: /** @type {PurchaseStatus} */ ("pending"),
@@ -570,54 +729,38 @@ async function buyCard(ctx, denom) {
   await ctx.reply(`Issuing Razer Gold US · $${denom}…`);
   try {
     const card = await buyRazerPin(denom, purchase.id);
-    purchase.status = "delivered";
-    purchase.pin = card.pin;
-    purchase.serial = card.serial;
     purchase.fazerOrderId = card.orderId;
-    purchase.costUsd = card.costUsd;
-    await save({ purchases: [purchase] });
-    await ctx.reply(
-      [
-        "Your PIN is below — keep this message.",
-        "",
-        `Razer Gold US · $${denom}`,
-        `PIN: \`${prettyPin(card.pin)}\``,
-        `Serial: \`${card.serial}\``,
-        "",
-        `Spent ${money(need)} USDT. Balance: ${money(user.balanceCents)} USDT`,
-        "",
-        "Redeem at gold.razer.com → Reload → Razer Gold PIN.",
-      ].join("\n"),
-            { parse_mode: "Markdown", reply_markup: homeKb() },
-    );
-    try {
-      await ctx.replyWithDocument(
-        new InputFile(
-          pinFile(denom, purchase.id, card.pin, card.serial),
-          `Goldroom-RazerGold-USD${denom}.txt`,
-        ),
-        {
-          caption:
-            "Download and keep this file. Screenshot the message above if you want a picture.",
-        },
-      );
-    } catch (fileErr) {
-      console.error("pin file send failed", fileErr instanceof Error ? fileErr.message : fileErr);
-    }
-    await notifyAdmin(
-      `Sold $${denom} to @${user.username}\n${purchase.id}\nFazer ${card.orderId || ""} · cost ${card.costUsd || "?"} USD`,
-    );
+    await finishPurchase(purchase, card.pin, card.serial, card.costUsd, card.orderId);
   } catch (err) {
-    user.balanceCents += need;
-    purchase.status = "failed";
-    await save({ users: [user], purchases: [purchase] });
+    const code = err && err.code;
+    const orderId = err && err.orderId;
     const msg = err instanceof Error ? err.message : String(err);
     console.error("fazer buy failed", msg);
-    await ctx.reply(
-      `This card is temporarily unavailable. Your ${money(need)} USDT is still on your balance (${money(user.balanceCents)}).\n\nPlease try again in a few minutes.`,
-      { reply_markup: homeKb() },
-    );
-    await notifyAdmin(`Fazer buy failed for @${user.username} $${denom}\n${purchase.id}\n${msg}\n\nFund Fazer, then they can retry.`);
+    if (orderId) purchase.fazerOrderId = orderId;
+    if (code === "PROCESSING" || err?.charged) {
+      await save({ purchases: [purchase] });
+      await ctx.reply(
+        "Your order is confirmed and being issued. The PIN will arrive in this chat. Do not buy again.",
+        { reply_markup: homeKb() },
+      );
+      await notifyAdmin(`Processing ${purchase.id} @${user.username} $${denom}\nFazer ${orderId || ""}`);
+      void watchPurchase(purchase.id);
+    } else if (code === "FAILED") {
+      await refundPurchase(purchase, msg);
+    } else if (code === "NO_OFFER") {
+      await refundPurchase(purchase, msg);
+    } else if (orderId || purchase.fazerOrderId) {
+      await save({ purchases: [purchase] });
+      await ctx.reply(
+        "Your order is being issued. The PIN will arrive in this chat. Do not buy again.",
+        { reply_markup: homeKb() },
+      );
+      void watchPurchase(purchase.id);
+    } else {
+      await refundPurchase(purchase, msg);
+    }
+  } finally {
+    buying.delete(chatId);
   }
 }
 
@@ -1057,6 +1200,9 @@ server.listen(PORT, "0.0.0.0", async () => {
   await loadDesk();
   for (const d of desk.deposits.values()) {
     if (d.status === "awaiting" || d.status === "checking") void watchPayment(d.id);
+  }
+  for (const p of desk.purchases.values()) {
+    if (p.status === "pending") void watchPurchase(p.id);
   }
   if (!bot) return;
   bot.start({
