@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
-import { DEFAULT_SETTINGS, priceFor, seedPins, uniquePayAmount } from "./catalog";
+import { DEFAULT_SETTINGS, priceFor, seedPins } from "./catalog";
 import type {
   BotScreen,
   ChatMessage,
@@ -298,7 +298,7 @@ export const useShop = create<ShopState>()(
               userMsg("Deposit"),
               botMsg({
                 kind: "text",
-                text: "Choose a deposit amount, or type one — for example 40 USDT.\n\nSend USDT on BEP20. Use the exact amount shown.",
+                text: "Choose a deposit amount, or type one — for example 24.8 or 1.\n\nSend that exact USDT amount on BEP20.",
                 keyboard: depositKeyboard(),
               }),
             ],
@@ -384,18 +384,18 @@ export const useShop = create<ShopState>()(
           const base = Number(action.slice(4));
           if (!Number.isFinite(base) || base <= 0) return;
           const { settings, seq } = get();
-          const pay = uniquePayAmount(base, seq, "usdt-bep20", settings.btcUsd);
+          const amount = (Math.round(base * 100) / 100).toFixed(2);
           const order: Order = {
             id: nextOrderId(seq),
             kind: "deposit",
             createdAt: Date.now(),
             expiresAt: Date.now() + ORDER_TTL_MS,
             network: "usdt-bep20",
-            payAmount: pay.amount,
+            payAmount: amount,
             payAsset: "USDT",
             address: settings.wallets["usdt-bep20"],
             status: "awaiting",
-            creditCents: Math.round(Number(pay.amount) * 100),
+            creditCents: Math.round(Number(amount) * 100),
           };
           set((s) => ({
             seq: s.seq + 1,
@@ -407,7 +407,7 @@ export const useShop = create<ShopState>()(
               botMsg({
                 kind: "pay",
                 orderId: order.id,
-                text: `Send exactly ${pay.amount} USDT`,
+                text: `Send exactly ${amount} USDT`,
                 keyboard: [
                   [{ id: `paid:${order.id}`, label: "I’ve paid", style: "primary", wide: true }],
                   [{ id: `cancel:${order.id}`, label: "Cancel", style: "ghost" }],

@@ -58,9 +58,9 @@ function nextId() {
   return id;
 }
 
-function uniqueUsdt(base, seq) {
-  const bump = 10 + (seq % 87);
-  const cents = Math.round(base * 100) + bump;
+function exactUsdt(n) {
+  const cents = Math.round(Number(n) * 100);
+  if (!Number.isFinite(cents) || cents < 1) return null;
   return (cents / 100).toFixed(2);
 }
 
@@ -341,7 +341,11 @@ async function startDeposit(ctx, baseUsdt) {
     await ctx.reply("Pay-in wallet is not set yet.");
     return;
   }
-  const amount = uniqueUsdt(baseUsdt, desk.seq);
+  const amount = exactUsdt(baseUsdt);
+  if (!amount) {
+    await ctx.reply("Enter an amount in USDT, for example 24.8 or 1.");
+    return;
+  }
   const user = ensureUser(ctx.chat.id, ctx.from?.username || String(ctx.from?.id));
   const deposit = {
     id: nextId(),
@@ -372,7 +376,7 @@ async function startDeposit(ctx, baseUsdt) {
       "To:",
       `\`${WALLET_BEP20}\``,
       "",
-      "Send the exact amount shown.",
+      "Send this amount. Network fees on your wallet are paid by you.",
     ].join("\n"),
     { parse_mode: "Markdown", reply_markup: kb },
   );
@@ -798,7 +802,7 @@ if (bot) {
     if (text === "Deposit") {
       sess.screen = "deposit";
       await ctx.reply(
-        "Choose a deposit amount, or type one — for example 40 USDT.\n\nSend USDT on BEP20. Use the exact amount shown.",
+        "Choose a deposit amount, or type one — for example 24.8 or 1.\n\nSend that exact USDT amount on BEP20. Network fees are paid from your wallet.",
         { reply_markup: depositKb() },
       );
       return;
@@ -850,8 +854,9 @@ if (bot) {
     }
 
     const dep = parseDepositLabel(text);
-    if (dep != null || (sess.screen === "deposit" && Number(text) > 0)) {
-      await startDeposit(ctx, dep ?? Number(text));
+    const typed = /^\d+(?:\.\d{1,8})?$/.test(text) ? Number(text) : NaN;
+    if (dep != null || (Number.isFinite(typed) && typed > 0)) {
+      await startDeposit(ctx, dep ?? typed);
       return;
     }
 
