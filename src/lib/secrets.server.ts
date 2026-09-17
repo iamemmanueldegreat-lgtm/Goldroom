@@ -26,7 +26,7 @@ export const SECRET_DEFS: SecretDef[] = [
   },
   {
     key: "CARD_API_KEY",
-    label: "Card API key",
+    label: "FazerCards API key",
     group: "cards",
     required: true,
   },

@@ -26,6 +26,7 @@ const STATUS_TONE: Record<OrderStatus, string> = {
   awaiting: "text-warn",
   checking: "text-warn",
   paid: "text-ok",
+  credited: "text-ok",
   delivered: "text-ok",
   cancelled: "text-subtle",
   expired: "text-subtle",
@@ -46,8 +47,8 @@ function BackOffice() {
             </p>
             <h1 className="mt-2 font-display text-4xl tracking-tight">Back office</h1>
             <p className="mt-2 max-w-xl text-sm leading-relaxed text-muted">
-              Stock, prices, and your BEP20 pay-in address. Bot tokens stay off
-              this page — they go in Railway when we wire the live bot.
+              Deposits, Fazer buys, and your BEP20 pay-in address. Bot tokens
+              stay off this page — they live in Railway.
             </p>
           </div>
           <Stats />
@@ -199,19 +200,18 @@ function SecretLine({ row }: { row: SecretRow }) {
 
 function Stats() {
   const orders = useShop((s) => s.orders);
-  const pins = useShop((s) => s.pins);
-  const delivered = orders.filter((o) => o.status === "delivered").length;
+  const balanceCents = useShop((s) => s.balanceCents);
   const pending = orders.filter(
-    (o) => o.status === "awaiting" || o.status === "checking",
+    (o) => o.kind === "deposit" && (o.status === "awaiting" || o.status === "checking"),
   ).length;
-  const stock = pins.filter((p) => p.status === "stock").length;
+  const cards = orders.filter((o) => o.kind === "card" && o.status === "delivered").length;
 
   return (
     <dl className="grid grid-cols-3 gap-3 sm:min-w-[320px]">
       {[
         { k: "Pending", v: pending },
-        { k: "Delivered", v: delivered },
-        { k: "In stock", v: stock },
+        { k: "Cards", v: cards },
+        { k: "Balance", v: (balanceCents / 100).toFixed(0) },
       ].map((s) => (
         <div key={s.k} className="rounded-lg bg-bg-elevated px-3 py-3 shadow-[var(--shadow-border)]">
           <dt className="text-[11px] uppercase tracking-wide text-muted">{s.k}</dt>
@@ -231,7 +231,7 @@ function OrdersPanel() {
   if (!list.length) {
     return (
       <div className="rounded-xl bg-bg-elevated px-5 py-12 text-center shadow-[var(--shadow-border)]">
-        <p className="text-sm text-muted">No orders yet. Buy a PIN from the desk chat.</p>
+        <p className="text-sm text-muted">No deposits yet. Use Deposit in the desk chat.</p>
       </div>
     );
   }
@@ -247,10 +247,13 @@ function OrdersPanel() {
               <div className="min-w-0">
                 <p className="font-mono text-sm">
                   {o.id}
-                  <span className="text-muted"> · ${o.denom}</span>
+                  <span className="text-muted">
+                    {" "}
+                    · {o.kind === "deposit" ? `${o.payAmount} USDT` : `$${o.denom}`}
+                  </span>
                 </p>
                 <p className="mt-1 text-xs text-muted">
-                  {o.payAmount} {o.payAsset} · {meta.chain} · {formatWhen(o.createdAt)}
+                  {o.payAmount} {o.payAsset} · {(meta ?? NETWORK_META["usdt-bep20"]).chain} · {formatWhen(o.createdAt)}
                 </p>
               </div>
               <div className="flex flex-wrap items-center gap-2">
@@ -260,7 +263,7 @@ function OrdersPanel() {
                 {actionable && (
                   <>
                     <Button size="sm" onClick={() => confirmPayment(o.id)}>
-                      Confirm paid
+                      Credit balance
                     </Button>
                     <Button
                       size="sm"

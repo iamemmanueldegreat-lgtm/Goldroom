@@ -14,6 +14,7 @@ import { nid } from "./utils";
 import { getLiveWallets } from "./secrets";
 
 const ORDER_TTL_MS = 30 * 60 * 1000;
+const DEPOSITS = [20, 30, 50, 100, 200];
 
 type ShopState = {
   hydrated: boolean;
@@ -22,6 +23,7 @@ type ShopState = {
   pins: Pin[];
   orders: Order[];
   seq: number;
+  balanceCents: number;
   messages: ChatMessage[];
   screen: BotScreen;
   typing: boolean;
@@ -40,6 +42,10 @@ type ShopState = {
 
 function nextOrderId(seq: number): string {
   return `GR-${String(1000 + seq)}`;
+}
+
+function money(cents: number) {
+  return (cents / 100).toFixed(2);
 }
 
 function botMsg(partial: Omit<ChatMessage, "id" | "from" | "at">): ChatMessage {
@@ -63,12 +69,48 @@ function userMsg(text: string): ChatMessage {
 
 function homeKeyboard() {
   return [
-    [{ id: "buy", label: "Buy Razer Gold", style: "primary" as const, wide: true }],
     [
-      { id: "orders", label: "Orders" },
-      { id: "help", label: "Help" },
+      { id: "deposit", label: "Deposit", style: "primary" as const },
+      { id: "buy", label: "Buy Razer Gold", style: "primary" as const },
     ],
+    [
+      { id: "balance", label: "Balance" },
+      { id: "orders", label: "Orders" },
+    ],
+    [{ id: "help", label: "Help", style: "ghost" as const }],
   ];
+}
+
+function depositKeyboard() {
+  const rows: { id: string; label: string; style?: "default" | "ghost" | "primary"; wide?: boolean }[][] = [];
+  for (let i = 0; i < DEPOSITS.length; i += 2) {
+    const row = [
+      { id: `dep:${DEPOSITS[i]}`, label: `${DEPOSITS[i]} USDT` },
+    ];
+    if (DEPOSITS[i + 1]) row.push({ id: `dep:${DEPOSITS[i + 1]}`, label: `${DEPOSITS[i + 1]} USDT` });
+    rows.push(row);
+  }
+  rows.push([{ id: "home", label: "Back", style: "ghost" }]);
+  return rows;
+}
+
+function catalogKeyboard(balanceCents: number, prices: Settings["prices"]) {
+  const rows: { id: string; label: string; style?: "default" | "ghost" }[][] = [];
+  const denoms: Denom[] = [10, 20, 25, 50, 100];
+  for (const d of denoms) {
+    const usdt = priceFor(prices, d);
+    const need = Math.round(usdt * 100);
+    rows.push([
+      {
+        id: `denom:${d}`,
+        label: balanceCents >= need ? `$${d} · ${usdt.toFixed(2)} USDT` : `$${d} · need ${usdt.toFixed(2)}`,
+        style: balanceCents >= need ? ("default" as const) : ("ghost" as const),
+      },
+    ]);
+  }
+  rows.push([{ id: "deposit", label: "Deposit" }]);
+  rows.push([{ id: "home", label: "Back", style: "ghost" }]);
+  return rows;
 }
 
 function welcomeMessage(): ChatMessage {
@@ -77,35 +119,9 @@ function welcomeMessage(): ChatMessage {
     from: "bot",
     at: 0,
     kind: "text",
-    text: "Goldroom\nPrivate desk for Razer Gold US.\n\nPay in crypto. PIN arrives in this chat.\nTap below to buy.",
+    text: "Goldroom\nPrivate desk for Razer Gold US.\n\n1. Deposit USDT on BEP20.\n2. Desk funds Fazer, then credits your balance.\n3. Buy a PIN with that balance.",
     keyboard: homeKeyboard(),
   };
-}
-
-function catalogKeyboard(stockOf: (d: Denom) => number, prices: Settings["prices"]) {
-  const rows: { id: string; label: string; style?: "default" | "ghost" }[][] = [];
-  const denoms: Denom[] = [10, 20, 25, 50, 100];
-  for (const d of denoms) {
-    const left = stockOf(d);
-    const usdt = priceFor(prices, d);
-    rows.push([
-      {
-        id: `denom:${d}`,
-        label: left > 0 ? `$${d} · ${usdt.toFixed(2)} USDT` : `$${d} · sold out`,
-        style: left > 0 ? ("default" as const) : ("ghost" as const),
-      },
-    ]);
-  }
-  rows.push([{ id: "home", label: "Back", style: "ghost" }]);
-  return rows;
-}
-
-function networkKeyboard() {
-  return [
-    [{ id: "net:usdt-bep20", label: "USDT · BEP20", style: "primary" as const, wide: true }],
-    [{ id: "net:btc", label: "Bitcoin" }],
-    [{ id: "catalog", label: "Back", style: "ghost" as const }],
-  ];
 }
 
 export const useShop = create<ShopState>()(
@@ -117,6 +133,7 @@ export const useShop = create<ShopState>()(
       pins: seedPins(),
       orders: [],
       seq: 1,
+      balanceCents: 0,
       messages: [welcomeMessage()],
       screen: { name: "home" },
       typing: false,
@@ -137,10 +154,7 @@ export const useShop = create<ShopState>()(
       addPins: (raw) => {
         const errors: string[] = [];
         const added: Pin[] = [];
-        const lines = raw
-          .split(/\n+/)
-          .map((l) => l.trim())
-          .filter(Boolean);
+        const lines = raw.split(/\n+/).map((l) => l.trim()).filter(Boolean);
         for (const line of lines) {
           const parts = line.split(/[,\s|]+/).filter(Boolean);
           const denom = Number(parts[0]) as Denom;
@@ -150,17 +164,9 @@ export const useShop = create<ShopState>()(
             errors.push(line);
             continue;
           }
-          added.push({
-            id: nid("pin"),
-            denom,
-            pin,
-            serial,
-            status: "stock",
-          });
+          added.push({ id: nid("pin"), denom, pin, serial, status: "stock" });
         }
-        if (added.length) {
-          set((s) => ({ pins: [...s.pins, ...added] }));
-        }
+        if (added.length) set((s) => ({ pins: [...s.pins, ...added] }));
         return { added: added.length, errors };
       },
 
@@ -169,6 +175,7 @@ export const useShop = create<ShopState>()(
           pins: seedPins(),
           orders: [],
           seq: 1,
+          balanceCents: 0,
           messages: [],
           screen: { name: "home" },
           typing: false,
@@ -195,11 +202,6 @@ export const useShop = create<ShopState>()(
             orders: s.orders.map((o) =>
               ids.has(o.id) ? { ...o, status: "expired" as const } : o,
             ),
-            pins: s.pins.map((p) =>
-              p.status === "reserved" && p.orderId && ids.has(p.orderId)
-                ? { ...p, status: "stock" as const, orderId: undefined }
-                : p,
-            ),
           };
         });
       },
@@ -220,8 +222,16 @@ export const useShop = create<ShopState>()(
           get().tap("home");
           return;
         }
+        if (lower === "deposit") {
+          get().tap("deposit");
+          return;
+        }
         if (lower === "/buy" || lower === "buy") {
           get().tap("buy");
+          return;
+        }
+        if (lower === "balance") {
+          get().tap("balance");
           return;
         }
         if (lower === "/orders" || lower === "orders") {
@@ -232,9 +242,18 @@ export const useShop = create<ShopState>()(
           get().tap("help");
           return;
         }
+        const usdt = t.match(/^(\d+(?:\.\d{1,2})?)\s*usdt$/i);
+        if (usdt) {
+          get().tap(`dep:${usdt[1]}`);
+          return;
+        }
         const asNum = Number(t.replace("$", ""));
         if ([10, 20, 25, 50, 100].includes(asNum)) {
           get().tap(`denom:${asNum}`);
+          return;
+        }
+        if (DEPOSITS.includes(asNum) || (asNum >= 5 && asNum <= 500)) {
+          get().tap(`dep:${asNum}`);
           return;
         }
         set((s) => ({
@@ -243,7 +262,7 @@ export const useShop = create<ShopState>()(
             userMsg(t),
             botMsg({
               kind: "text",
-              text: "Use the buttons below, or type buy, orders, or help.",
+              text: "Use the buttons below, or type deposit, buy, balance, or help.",
               keyboard: homeKeyboard(),
             }),
           ],
@@ -271,21 +290,50 @@ export const useShop = create<ShopState>()(
           return;
         }
 
+        if (action === "deposit") {
+          set((s) => ({
+            screen: { name: "deposit" },
+            messages: [
+              ...s.messages,
+              userMsg("Deposit"),
+              botMsg({
+                kind: "text",
+                text: "Pick how much USDT to load.\nMatching cents are added so the desk can identify your payment.\n\nAfter it arrives, the desk funds Fazer, then credits your Goldroom balance.",
+                keyboard: depositKeyboard(),
+              }),
+            ],
+          }));
+          return;
+        }
+
+        if (action === "balance") {
+          set((s) => ({
+            messages: [
+              ...s.messages,
+              userMsg("Balance"),
+              botMsg({
+                kind: "text",
+                text: `Goldroom balance: ${money(s.balanceCents)} USDT`,
+                keyboard: homeKeyboard(),
+              }),
+            ],
+          }));
+          return;
+        }
+
         if (action === "buy" || action === "catalog") {
-          const left = get().stockCount();
-          const body =
-            left === 0
-              ? "Stock is empty. The desk will restock shortly."
-              : "Razer Gold · United States\n\nPINs redeem at gold.razer.com.\nDelivered in chat after payment confirms.\n\nPick an amount.";
           set((s) => ({
             screen: { name: "catalog" },
             messages: [
               ...s.messages,
-              userMsg(action === "catalog" ? "Amounts" : "Buy Razer Gold"),
+              userMsg("Buy Razer Gold"),
               botMsg({
                 kind: "text",
-                text: body,
-                keyboard: catalogKeyboard(get().stockCount, s.settings.prices),
+                text:
+                  s.balanceCents <= 0
+                    ? "Balance is 0.00 USDT.\nDeposit first. After the desk funds Fazer, you can buy."
+                    : `Razer Gold · United States\nBalance: ${money(s.balanceCents)} USDT\n\nPick an amount you can afford. PIN comes from Fazer.`,
+                keyboard: catalogKeyboard(s.balanceCents, s.settings.prices),
               }),
             ],
           }));
@@ -300,8 +348,7 @@ export const useShop = create<ShopState>()(
               userMsg("How it works"),
               botMsg({
                 kind: "text",
-                text:
-                  "Four steps.\n\n1. Pick a Razer Gold US amount.\n2. Pay in USDT on BEP20 (BNB Smart Chain — not TRC20, not ERC20).\n3. Send the exact amount shown — the extra cents are how we match your payment.\n4. Tap I’ve paid. The PIN lands in this chat.\n\nRedeem at gold.razer.com → Reload → Razer Gold PIN.\nUS PINs only. No refunds once the code is revealed.",
+                text: "1. Deposit USDT on BEP20 (exact amount).\n2. Desk sends that USDT to FazerCards.\n3. After Fazer is funded, your Goldroom balance is credited.\n4. Buy Razer Gold US up to your balance. PIN lands here.\n\nRedeem at gold.razer.com → Reload → Razer Gold PIN.",
                 keyboard: homeKeyboard(),
               }),
             ],
@@ -313,110 +360,56 @@ export const useShop = create<ShopState>()(
           const mine = get().orders.slice().reverse();
           const lines =
             mine.length === 0
-              ? "No orders yet."
+              ? "No deposits or cards yet."
               : mine
                   .slice(0, 8)
-                  .map((o) => `${o.id}  ·  $${o.denom}  ·  ${o.status}`)
+                  .map((o) =>
+                    o.kind === "deposit"
+                      ? `${o.id}  ·  ${o.payAmount} ${o.payAsset}  ·  ${o.status}`
+                      : `${o.id}  ·  $${o.denom}  ·  ${o.status}`,
+                  )
                   .join("\n");
           set((s) => ({
             screen: { name: "orders" },
             messages: [
               ...s.messages,
               userMsg("My orders"),
-              botMsg({
-                kind: "text",
-                text: lines,
-                keyboard: homeKeyboard(),
-              }),
+              botMsg({ kind: "text", text: lines, keyboard: homeKeyboard() }),
             ],
           }));
           return;
         }
 
-        if (action.startsWith("denom:")) {
-          const denom = Number(action.slice(6)) as Denom;
-          const left = get().stockCount(denom);
-          const usdt = priceFor(get().settings.prices, denom);
-          if (left === 0) {
-            set((s) => ({
-              messages: [
-                ...s.messages,
-                userMsg(`$${denom}`),
-                botMsg({
-                  kind: "text",
-                  text: `$${denom} is out of stock. Pick another amount.`,
-                  keyboard: catalogKeyboard(get().stockCount, s.settings.prices),
-                }),
-              ],
-              screen: { name: "catalog" },
-            }));
-            return;
-          }
-          set((s) => ({
-            screen: { name: "network", denom },
-            messages: [
-              ...s.messages,
-              userMsg(`Razer Gold $${denom}`),
-              botMsg({
-                kind: "text",
-                text: `Razer Gold US · $${denom}\nYou pay ${usdt.toFixed(2)} USDT on BEP20 (plus matching cents).\n\n${s.settings.markupNote}\n\nBEP20 only — TRC20 or ERC20 will not arrive.`,
-                keyboard: networkKeyboard(),
-              }),
-            ],
-          }));
-          return;
-        }
-
-        if (action.startsWith("net:")) {
-          const network = action.slice(4) as Network;
-          const screen = get().screen;
-          const denom = screen.name === "network" ? screen.denom : undefined;
-          if (!denom) {
-            get().tap("buy");
-            return;
-          }
-          const pin = get().pins.find((p) => p.status === "stock" && p.denom === denom);
-          if (!pin) {
-            get().tap("buy");
-            return;
-          }
+        if (action.startsWith("dep:")) {
+          const base = Number(action.slice(4));
+          if (!Number.isFinite(base) || base <= 0) return;
           const { settings, seq } = get();
-          const pay = uniquePayAmount(
-            priceFor(settings.prices, denom),
-            seq,
-            network,
-            settings.btcUsd,
-          );
+          const pay = uniquePayAmount(base, seq, "usdt-bep20", settings.btcUsd);
           const order: Order = {
             id: nextOrderId(seq),
+            kind: "deposit",
             createdAt: Date.now(),
             expiresAt: Date.now() + ORDER_TTL_MS,
-            denom,
-            network,
+            network: "usdt-bep20",
             payAmount: pay.amount,
-            payAsset: pay.asset,
-            address: settings.wallets[network],
+            payAsset: "USDT",
+            address: settings.wallets["usdt-bep20"],
             status: "awaiting",
-            pinId: pin.id,
+            creditCents: Math.round(Number(pay.amount) * 100),
           };
           set((s) => ({
             seq: s.seq + 1,
-            pins: s.pins.map((p) =>
-              p.id === pin.id ? { ...p, status: "reserved", orderId: order.id } : p,
-            ),
             orders: [...s.orders, order],
             screen: { name: "pay", orderId: order.id },
             messages: [
               ...s.messages,
-              userMsg(network === "btc" ? "Bitcoin" : "USDT · BEP20"),
+              userMsg(`${base} USDT`),
               botMsg({
                 kind: "pay",
                 orderId: order.id,
-                text: `Send exactly ${pay.amount} ${pay.asset}`,
+                text: `Send exactly ${pay.amount} USDT`,
                 keyboard: [
-                  [
-                    { id: `paid:${order.id}`, label: "I’ve paid", style: "primary", wide: true },
-                  ],
+                  [{ id: `paid:${order.id}`, label: "I’ve paid", style: "primary", wide: true }],
                   [{ id: `cancel:${order.id}`, label: "Cancel", style: "ghost" }],
                 ],
               }),
@@ -425,19 +418,71 @@ export const useShop = create<ShopState>()(
           return;
         }
 
-        if (action.startsWith("paid:")) {
-          const orderId = action.slice(5);
-          get().confirmPayment(orderId);
+        if (action.startsWith("denom:")) {
+          const denom = Number(action.slice(6)) as Denom;
+          const need = Math.round(priceFor(get().settings.prices, denom) * 100);
+          if (get().balanceCents < need) {
+            set((s) => ({
+              messages: [
+                ...s.messages,
+                userMsg(`$${denom}`),
+                botMsg({
+                  kind: "text",
+                  text: `Need ${money(need)} USDT for $${denom}. You have ${money(s.balanceCents)}.\nDeposit first.`,
+                  keyboard: depositKeyboard(),
+                }),
+              ],
+              screen: { name: "deposit" },
+            }));
+            return;
+          }
+          const pin = get().pins.find((p) => p.status === "stock" && p.denom === denom);
+          const demoPin = pin?.pin ?? `0000${denom}99999999`;
+          const demoSerial = pin?.serial ?? `FZ-${denom}`;
+          const order: Order = {
+            id: nextOrderId(get().seq),
+            kind: "card",
+            createdAt: Date.now(),
+            expiresAt: Date.now() + ORDER_TTL_MS,
+            denom,
+            network: "usdt-bep20",
+            payAmount: money(need),
+            payAsset: "USDT",
+            address: "",
+            status: "delivered",
+            pin: demoPin,
+            serial: demoSerial,
+            pinId: pin?.id,
+            deliveredAt: Date.now(),
+          };
+          set((s) => ({
+            seq: s.seq + 1,
+            balanceCents: s.balanceCents - need,
+            pins: pin
+              ? s.pins.map((p) => (p.id === pin.id ? { ...p, status: "sold" as const } : p))
+              : s.pins,
+            orders: [...s.orders, order],
+            screen: { name: "done", orderId: order.id },
+            messages: [
+              ...s.messages,
+              userMsg(`Razer Gold $${denom}`),
+              botMsg({
+                kind: "pin",
+                orderId: order.id,
+                text: `Your PIN is below — keep this message.\nSpent ${money(need)} USDT. Balance: ${money(s.balanceCents - need)} USDT`,
+                keyboard: [[{ id: "buy", label: "Buy another", style: "primary", wide: true }]],
+              }),
+            ],
+          }));
           return;
         }
 
+        if (action.startsWith("paid:")) {
+          get().confirmPayment(action.slice(5));
+          return;
+        }
         if (action.startsWith("cancel:")) {
           get().cancelOrder(action.slice(7));
-          return;
-        }
-
-        if (action === "buy_again") {
-          get().tap("buy");
         }
       },
 
@@ -446,7 +491,6 @@ export const useShop = create<ShopState>()(
         if (!order || (order.status !== "awaiting" && order.status !== "checking")) {
           return;
         }
-
         const auto = get().settings.autoConfirm;
 
         if (order.status === "awaiting") {
@@ -461,8 +505,8 @@ export const useShop = create<ShopState>()(
                 kind: "status",
                 orderId,
                 text: auto
-                  ? "Checking the chain for the exact amount…"
-                  : "Payment flagged. The desk will confirm and send your PIN here.",
+                  ? "Desk is funding Fazer, then your balance…"
+                  : "Payment flagged. The desk will fund Fazer, then credit your balance.",
               }),
             ],
           }));
@@ -474,32 +518,19 @@ export const useShop = create<ShopState>()(
           return;
         }
 
-        const pin = get().pins.find((p) => p.id === order.pinId);
+        const credit = order.creditCents ?? Math.round(Number(order.payAmount) * 100);
         set((s) => ({
+          balanceCents: s.balanceCents + credit,
           orders: s.orders.map((o) =>
-            o.id === orderId
-              ? {
-                  ...o,
-                  status: "delivered" as const,
-                  pin: pin?.pin,
-                  serial: pin?.serial,
-                  deliveredAt: Date.now(),
-                }
-              : o,
+            o.id === orderId ? { ...o, status: "credited" as const } : o,
           ),
-          pins: s.pins.map((p) =>
-            p.id === order.pinId ? { ...p, status: "sold" as const } : p,
-          ),
-          screen: { name: "done", orderId },
+          screen: { name: "home" },
           messages: [
             ...s.messages,
             botMsg({
-              kind: "pin",
-              orderId,
-              text: "Payment received. Your PIN is below — keep this message.",
-              keyboard: [
-                [{ id: "buy_again", label: "Buy another", style: "primary", wide: true }],
-              ],
+              kind: "text",
+              text: `Deposit ${orderId} credited.\nBalance: ${money(s.balanceCents + credit)} USDT\n\nYou can buy Razer Gold up to that amount.`,
+              keyboard: homeKeyboard(),
             }),
           ],
         }));
@@ -514,18 +545,13 @@ export const useShop = create<ShopState>()(
           orders: s.orders.map((o) =>
             o.id === orderId ? { ...o, status: "cancelled" as const } : o,
           ),
-          pins: s.pins.map((p) =>
-            p.id === order.pinId
-              ? { ...p, status: "stock" as const, orderId: undefined }
-              : p,
-          ),
           screen: { name: "home" },
           messages: [
             ...s.messages,
             userMsg("Cancel"),
             botMsg({
               kind: "text",
-              text: `${orderId} cancelled. Nothing was sent.`,
+              text: `${orderId} cancelled. Nothing was credited.`,
               keyboard: homeKeyboard(),
             }),
           ],
@@ -533,13 +559,14 @@ export const useShop = create<ShopState>()(
       },
     }),
     {
-      name: "goldroom-v3",
+      name: "goldroom-v4",
       skipHydration: true,
       partialize: (s) => ({
         settings: s.settings,
         pins: s.pins,
         orders: s.orders,
         seq: s.seq,
+        balanceCents: s.balanceCents,
       }),
       onRehydrateStorage: () => (state) => {
         state?.setHydrated(true);

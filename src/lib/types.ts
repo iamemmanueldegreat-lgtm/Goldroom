@@ -8,6 +8,7 @@ export type OrderStatus =
   | "awaiting"
   | "checking"
   | "paid"
+  | "credited"
   | "delivered"
   | "cancelled"
   | "expired";
@@ -25,14 +26,16 @@ export type Pin = {
 
 export type Order = {
   id: string;
+  kind: "deposit" | "card";
   createdAt: number;
   expiresAt: number;
-  denom: Denom;
+  denom?: Denom;
   network: Network;
   payAmount: string;
   payAsset: "USDT" | "BTC";
   address: string;
   status: OrderStatus;
+  creditCents?: number;
   pinId?: string;
   pin?: string;
   serial?: string;
@@ -79,8 +82,8 @@ export type ChatMessage = {
 
 export type BotScreen =
   | { name: "home" }
+  | { name: "deposit" }
   | { name: "catalog" }
-  | { name: "network"; denom: Denom }
   | { name: "pay"; orderId: string }
   | { name: "done"; orderId: string }
   | { name: "orders" }

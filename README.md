@@ -1,6 +1,6 @@
 # Goldroom
 
-Private Razer Gold US desk. Buyers pay USDT on BEP20. PINs arrive in Telegram.
+Private Razer Gold US desk. Buyers deposit USDT on BEP20. You fund FazerCards, credit their Goldroom balance, then they buy PINs from the Fazer API.
 
 ## Railway
 
@@ -14,18 +14,22 @@ ADMIN_TELEGRAM_ID
 WALLET_USDT_BEP20
 SUPABASE_URL
 SUPABASE_SERVICE_ROLE_KEY
+CARD_API_KEY
 ```
 
-Optional: `CARD_API_KEY`, `ALLOWLIST`, `WALLET_BTC`.
+Optional: `FAZER_CATEGORY_ID`, `ALLOWLIST`, `WALLET_BTC`.
 
 Start command: `node server.mjs`
 
 ## Supabase
 
-Once, in the Supabase SQL Editor, run `bot/schema.sql`. Then redeploy.
+Run `bot/schema.sql` then `bot/schema-v2.sql` in the SQL Editor.
 
-After a green deploy, send `/start` to the bot, then load stock (admin only):
+## Flow
 
-`/stock 25 PIN SERIAL`
+1. Buyer taps **Deposit** and sends the exact BEP20 amount.
+2. You send that USDT to FazerCards.
+3. You tap **Credit balance** on the admin message.
+4. Buyer taps **Buy Razer Gold**. The PIN is pulled from Fazer.
 
-`ADMIN_TELEGRAM_ID` is your numeric id from [@userinfobot](https://t.me/userinfobot).
+Admin: `/balance` (shows Fazer wallet too), `/catalog` (Razer offers), `/credit 123456789 25`.

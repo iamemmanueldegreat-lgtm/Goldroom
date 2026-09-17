@@ -1,10 +1,16 @@
 import http from "node:http";
 import { Bot, InlineKeyboard, Keyboard } from "grammy";
 import { createClient } from "@supabase/supabase-js";
+import {
+  buyRazerPin,
+  fazerBalance,
+  fazerConfigured,
+  matchOffer,
+  razerCatalog,
+} from "./fazer.mjs";
 
 const TOKEN = (process.env.TELEGRAM_BOT_TOKEN || "").trim();
 const WALLET_BEP20 = (process.env.WALLET_USDT_BEP20 || "").trim();
-const WALLET_BTC = (process.env.WALLET_BTC || "").trim();
 const ADMIN_ID = Number((process.env.ADMIN_TELEGRAM_ID || "").trim()) || 0;
 const SUPABASE_URL = (process.env.SUPABASE_URL || "").trim();
 const SUPABASE_KEY = (process.env.SUPABASE_SERVICE_ROLE_KEY || "").trim();
@@ -16,9 +22,10 @@ const PORT = Number(process.env.PORT || 3000);
 const ORDER_TTL_MS = 30 * 60 * 1000;
 const PRICES = { 10: 11.5, 20: 22.8, 25: 28.2, 50: 55.5, 100: 109 };
 const DENOMS = [10, 20, 25, 50, 100];
+const DEPOSITS = [20, 30, 50, 100, 200];
 
-/** @typedef {"stock" | "reserved" | "sold"} PinStatus */
-/** @typedef {"awaiting" | "checking" | "delivered" | "cancelled"} OrderStatus */
+/** @typedef {"awaiting" | "checking" | "credited" | "cancelled"} DepositStatus */
+/** @typedef {"pending" | "delivered" | "failed"} PurchaseStatus */
 
 const db =
   SUPABASE_URL && SUPABASE_KEY
@@ -30,11 +37,13 @@ const db =
 const desk = {
   seq: 1,
   ready: !db,
-  /** @type {Array<{id: string, denom: number, pin: string, serial: string, status: PinStatus, orderId?: string}>} */
-  pins: [],
-  /** @type {Map<string, {id: string, chatId: number, username: string, denom: number, network: string, payAmount: string, payAsset: string, address: string, status: OrderStatus, pinId?: string, createdAt: number, expiresAt: number, deliveredAt?: number}>} */
-  orders: new Map(),
-  /** @type {Map<number, {screen: string, denom?: number, orderId?: string}>} */
+  /** @type {Map<number, {chatId: number, username: string, balanceCents: number}>} */
+  users: new Map(),
+  /** @type {Map<string, {id: string, chatId: number, username: string, payAmount: string, payAsset: string, address: string, creditCents: number, status: DepositStatus, createdAt: number, expiresAt: number, creditedAt?: number}>} */
+  deposits: new Map(),
+  /** @type {Map<string, {id: string, chatId: number, denom: number, retailCents: number, costUsd?: string, fazerOrderId?: string, pin?: string, serial?: string, status: PurchaseStatus, createdAt: number}>} */
+  purchases: new Map(),
+  /** @type {Map<number, {screen: string, denom?: number, depositId?: string}>} */
   sessions: new Map(),
 };
 
@@ -42,24 +51,28 @@ function nid(prefix) {
   return `${prefix}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
 }
 
-function nextOrderId() {
+function nextId() {
   const id = `GR-${String(1000 + desk.seq)}`;
   desk.seq += 1;
   return id;
 }
 
-function uniqueAmount(baseUsdt, seq, network) {
+function uniqueUsdt(base, seq) {
   const bump = 10 + (seq % 87);
-  if (network === "btc") {
-    const btcUsd = Number(process.env.BTC_USD || 64000);
-    return { amount: ((baseUsdt + bump / 100) / btcUsd).toFixed(6), asset: "BTC" };
-  }
-  const cents = Math.round(baseUsdt * 100) + bump;
-  return { amount: (cents / 100).toFixed(2), asset: "USDT" };
+  const cents = Math.round(base * 100) + bump;
+  return (cents / 100).toFixed(2);
 }
 
-function stockCount(denom) {
-  return desk.pins.filter((p) => p.status === "stock" && (!denom || p.denom === denom)).length;
+function money(cents) {
+  return (cents / 100).toFixed(2);
+}
+
+function centsOf(amount) {
+  return Math.round(Number(amount) * 100);
+}
+
+function retailCents(denom) {
+  return Math.round(PRICES[denom] * 100);
 }
 
 function sessionOf(chatId) {
@@ -67,44 +80,68 @@ function sessionOf(chatId) {
   return desk.sessions.get(chatId);
 }
 
-function pinRow(p) {
+function ensureUser(chatId, username) {
+  if (!desk.users.has(chatId)) {
+    desk.users.set(chatId, { chatId, username: username || "", balanceCents: 0 });
+  } else if (username) {
+    desk.users.get(chatId).username = username;
+  }
+  return desk.users.get(chatId);
+}
+
+function userRow(u) {
+  return {
+    chat_id: u.chatId,
+    username: u.username,
+    balance_cents: u.balanceCents,
+    updated_at: new Date().toISOString(),
+  };
+}
+
+function depositRow(d) {
+  return {
+    id: d.id,
+    chat_id: d.chatId,
+    username: d.username,
+    pay_amount: d.payAmount,
+    pay_asset: d.payAsset,
+    address: d.address,
+    credit_cents: d.creditCents,
+    status: d.status,
+    created_at: new Date(d.createdAt).toISOString(),
+    expires_at: new Date(d.expiresAt).toISOString(),
+    credited_at: d.creditedAt ? new Date(d.creditedAt).toISOString() : null,
+  };
+}
+
+function purchaseRow(p) {
   return {
     id: p.id,
+    chat_id: p.chatId,
     denom: p.denom,
-    pin: p.pin,
-    serial: p.serial,
+    retail_cents: p.retailCents,
+    cost_usd: p.costUsd || null,
+    fazer_order_id: p.fazerOrderId || null,
+    pin: p.pin || null,
+    serial: p.serial || null,
     status: p.status,
-    order_id: p.orderId || null,
+    created_at: new Date(p.createdAt).toISOString(),
   };
 }
 
-function orderRow(o) {
-  return {
-    id: o.id,
-    chat_id: o.chatId,
-    username: o.username,
-    denom: o.denom,
-    network: o.network,
-    pay_amount: o.payAmount,
-    pay_asset: o.payAsset,
-    address: o.address,
-    status: o.status,
-    pin_id: o.pinId || null,
-    created_at: new Date(o.createdAt).toISOString(),
-    expires_at: new Date(o.expiresAt).toISOString(),
-    delivered_at: o.deliveredAt ? new Date(o.deliveredAt).toISOString() : null,
-  };
-}
-
-async function save(pins = [], orders = []) {
+async function save({ users = [], deposits = [], purchases = [] } = {}) {
   if (!db) return;
   try {
-    if (pins.length) {
-      const { error } = await db.from("goldroom_pins").upsert(pins.map(pinRow));
+    if (users.length) {
+      const { error } = await db.from("goldroom_users").upsert(users.map(userRow));
       if (error) throw error;
     }
-    if (orders.length) {
-      const { error } = await db.from("goldroom_orders").upsert(orders.map(orderRow));
+    if (deposits.length) {
+      const { error } = await db.from("goldroom_deposits").upsert(deposits.map(depositRow));
+      if (error) throw error;
+    }
+    if (purchases.length) {
+      const { error } = await db.from("goldroom_purchases").upsert(purchases.map(purchaseRow));
       if (error) throw error;
     }
     const { error } = await db.from("goldroom_meta").upsert({ key: "seq", value: desk.seq });
@@ -116,77 +153,107 @@ async function save(pins = [], orders = []) {
 
 async function loadDesk() {
   if (!db) {
-    console.warn("SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY missing — memory only");
+    console.warn("Supabase missing — memory only");
     return false;
   }
   try {
-    const pinsRes = await db.from("goldroom_pins").select("*");
-    if (pinsRes.error) throw pinsRes.error;
-    const ordersRes = await db.from("goldroom_orders").select("*");
-    if (ordersRes.error) throw ordersRes.error;
-    const metaRes = await db.from("goldroom_meta").select("value").eq("key", "seq").maybeSingle();
-    if (metaRes.error) throw metaRes.error;
-
-    desk.pins = (pinsRes.data || []).map((r) => ({
-      id: r.id,
-      denom: r.denom,
-      pin: r.pin,
-      serial: r.serial,
-      status: r.status,
-      orderId: r.order_id || undefined,
-    }));
-    desk.orders = new Map(
-      (ordersRes.data || []).map((r) => [
+    const [users, deposits, purchases, meta] = await Promise.all([
+      db.from("goldroom_users").select("*"),
+      db.from("goldroom_deposits").select("*"),
+      db.from("goldroom_purchases").select("*"),
+      db.from("goldroom_meta").select("value").eq("key", "seq").maybeSingle(),
+    ]);
+    if (users.error) throw users.error;
+    if (deposits.error) throw deposits.error;
+    if (purchases.error) throw purchases.error;
+    if (meta.error) throw meta.error;
+    desk.users = new Map(
+      (users.data || []).map((r) => [
+        Number(r.chat_id),
+        {
+          chatId: Number(r.chat_id),
+          username: r.username || "",
+          balanceCents: Number(r.balance_cents) || 0,
+        },
+      ]),
+    );
+    desk.deposits = new Map(
+      (deposits.data || []).map((r) => [
         r.id,
         {
           id: r.id,
           chatId: Number(r.chat_id),
           username: r.username || "",
-          denom: r.denom,
-          network: r.network,
           payAmount: r.pay_amount,
           payAsset: r.pay_asset,
           address: r.address,
+          creditCents: Number(r.credit_cents) || 0,
           status: r.status,
-          pinId: r.pin_id || undefined,
           createdAt: new Date(r.created_at).getTime(),
           expiresAt: new Date(r.expires_at).getTime(),
-          deliveredAt: r.delivered_at ? new Date(r.delivered_at).getTime() : undefined,
+          creditedAt: r.credited_at ? new Date(r.credited_at).getTime() : undefined,
         },
       ]),
     );
-    desk.seq = Number(metaRes.data?.value) || 1;
+    desk.purchases = new Map(
+      (purchases.data || []).map((r) => [
+        r.id,
+        {
+          id: r.id,
+          chatId: Number(r.chat_id),
+          denom: r.denom,
+          retailCents: r.retail_cents,
+          costUsd: r.cost_usd || undefined,
+          fazerOrderId: r.fazer_order_id || undefined,
+          pin: r.pin || undefined,
+          serial: r.serial || undefined,
+          status: r.status,
+          createdAt: new Date(r.created_at).getTime(),
+        },
+      ]),
+    );
+    desk.seq = Number(meta.data?.value) || 1;
     desk.ready = true;
-    console.log(`supabase loaded ${desk.pins.length} pins, ${desk.orders.size} orders, seq ${desk.seq}`);
+    console.log(
+      `supabase loaded ${desk.users.size} users, ${desk.deposits.size} deposits, ${desk.purchases.size} purchases`,
+    );
     return true;
   } catch (err) {
-    console.error(
-      "supabase load failed — run bot/schema.sql in the Supabase SQL editor:",
-      err.message || err,
-    );
+    console.error("supabase load failed — run bot/schema-v2.sql:", err.message || err);
     return false;
   }
 }
 
 function homeKb() {
-  return new Keyboard().text("Buy Razer Gold").row().text("Orders").text("Help").resized();
+  return new Keyboard()
+    .text("Deposit")
+    .text("Buy Razer Gold")
+    .row()
+    .text("Balance")
+    .text("Orders")
+    .row()
+    .text("Help")
+    .resized();
 }
 
-function catalogKb() {
+function depositKb() {
   const kb = new Keyboard();
-  for (const d of DENOMS) {
-    const left = stockCount(d);
-    const price = PRICES[d].toFixed(2);
-    kb.text(left > 0 ? `$${d} · ${price} USDT` : `$${d} · sold out`).row();
-  }
+  DEPOSITS.forEach((n, i) => {
+    kb.text(`${n} USDT`);
+    if (i % 2 === 1) kb.row();
+  });
+  if (DEPOSITS.length % 2 === 1) kb.row();
   kb.text("Back");
   return kb.resized();
 }
 
-function networkKb() {
-  const kb = new Keyboard().text("USDT · BEP20");
-  if (WALLET_BTC) kb.row().text("Bitcoin");
-  kb.row().text("Back");
+function catalogKb(balanceCents) {
+  const kb = new Keyboard();
+  for (const d of DENOMS) {
+    const need = retailCents(d);
+    kb.text(balanceCents >= need ? `$${d} · ${money(need)} USDT` : `$${d} · need ${money(need)}`).row();
+  }
+  kb.text("Deposit").row().text("Back");
   return kb.resized();
 }
 
@@ -203,25 +270,18 @@ function isAdmin(ctx) {
 
 async function expireStale() {
   const now = Date.now();
-  const pins = [];
-  const orders = [];
-  for (const order of desk.orders.values()) {
-    if (order.status === "awaiting" && order.expiresAt < now) {
-      order.status = "cancelled";
-      orders.push(order);
-      const pin = desk.pins.find((p) => p.id === order.pinId);
-      if (pin && pin.status === "reserved") {
-        pin.status = "stock";
-        pin.orderId = undefined;
-        pins.push(pin);
-      }
+  const dirty = [];
+  for (const d of desk.deposits.values()) {
+    if (d.status === "awaiting" && d.expiresAt < now) {
+      d.status = "cancelled";
+      dirty.push(d);
     }
   }
-  if (pins.length || orders.length) await save(pins, orders);
+  if (dirty.length) await save({ deposits: dirty });
 }
 
 function prettyPin(pin) {
-  return pin.replace(/(\d{4})(?=\d)/g, "$1 ").trim();
+  return String(pin).replace(/(\d{4})(?=\d)/g, "$1 ").trim();
 }
 
 async function sendHome(ctx, text) {
@@ -229,16 +289,13 @@ async function sendHome(ctx, text) {
   await ctx.reply(text, { reply_markup: homeKb() });
 }
 
-async function sendCatalog(ctx, intro) {
-  await expireStale();
-  sessionOf(ctx.chat.id).screen = "catalog";
-  const left = stockCount();
-  const body =
-    intro ||
-    (left === 0
-      ? "Stock is empty. The desk will restock shortly."
-      : "Razer Gold · United States\n\nPINs redeem at gold.razer.com.\nDelivered in chat after payment confirms.\n\nPick an amount.");
-  await ctx.reply(body, { reply_markup: catalogKb() });
+async function notifyAdmin(text, extra = {}) {
+  if (!ADMIN_ID || !bot) return;
+  try {
+    await bot.api.sendMessage(ADMIN_ID, text, extra);
+  } catch (err) {
+    console.error("admin notify failed", err instanceof Error ? err.message : err);
+  }
 }
 
 function parseDenomLabel(text) {
@@ -248,12 +305,139 @@ function parseDenomLabel(text) {
   return DENOMS.includes(d) ? d : null;
 }
 
-async function notifyAdmin(bot, text, extra = {}) {
-  if (!ADMIN_ID) return;
+function parseDepositLabel(text) {
+  const m = text.match(/^(\d+(?:\.\d{1,2})?)\s*USDT$/i);
+  if (!m) return null;
+  const n = Number(m[1]);
+  return n > 0 ? n : null;
+}
+
+async function startDeposit(ctx, baseUsdt) {
+  if (!WALLET_BEP20) {
+    await ctx.reply("Pay-in wallet is not set yet.");
+    return;
+  }
+  const amount = uniqueUsdt(baseUsdt, desk.seq);
+  const user = ensureUser(ctx.chat.id, ctx.from?.username || String(ctx.from?.id));
+  const deposit = {
+    id: nextId(),
+    chatId: ctx.chat.id,
+    username: user.username,
+    payAmount: amount,
+    payAsset: "USDT",
+    address: WALLET_BEP20,
+    creditCents: centsOf(amount),
+    status: /** @type {DepositStatus} */ ("awaiting"),
+    createdAt: Date.now(),
+    expiresAt: Date.now() + ORDER_TTL_MS,
+  };
+  desk.deposits.set(deposit.id, deposit);
+  sessionOf(ctx.chat.id).screen = "pay";
+  sessionOf(ctx.chat.id).depositId = deposit.id;
+  await save({ deposits: [deposit] });
+  const kb = new InlineKeyboard()
+    .text("I’ve paid", `paid:${deposit.id}`)
+    .row()
+    .text("Cancel", `cancel:${deposit.id}`);
+  await ctx.reply(
+    [
+      `Send exactly ${amount} USDT`,
+      "Network: USDT · BEP20",
+      `Deposit: ${deposit.id}`,
+      "",
+      "To:",
+      `\`${WALLET_BEP20}\``,
+      "",
+      "BEP20 only. TRC20 or ERC20 will not land.",
+      "After it arrives, the desk funds Fazer, then credits your Goldroom balance.",
+    ].join("\n"),
+    { parse_mode: "Markdown", reply_markup: kb },
+  );
+}
+
+async function creditDeposit(depositId) {
+  const d = desk.deposits.get(depositId);
+  if (!d) return "Not found";
+  if (d.status === "credited") return "Already credited";
+  if (d.status !== "awaiting" && d.status !== "checking") return "Closed";
+  const user = ensureUser(d.chatId, d.username);
+  user.balanceCents += d.creditCents;
+  d.status = "credited";
+  d.creditedAt = Date.now();
+  await save({ users: [user], deposits: [d] });
+  if (bot) {
+    await bot.api.sendMessage(
+      d.chatId,
+      `Deposit ${d.id} credited.\nBalance: ${money(user.balanceCents)} USDT\n\nYou can buy Razer Gold up to that amount.`,
+      { reply_markup: homeKb() },
+    );
+  }
+  return "Credited";
+}
+
+async function buyCard(ctx, denom) {
+  const user = ensureUser(ctx.chat.id, ctx.from?.username || String(ctx.from?.id));
+  const need = retailCents(denom);
+  if (user.balanceCents < need) {
+    await ctx.reply(
+      `Need ${money(need)} USDT for $${denom}. You have ${money(user.balanceCents)}.\nDeposit first.`,
+      { reply_markup: depositKb() },
+    );
+    sessionOf(ctx.chat.id).screen = "deposit";
+    return;
+  }
+  if (!fazerConfigured()) {
+    await ctx.reply("The supplier key is not on the desk yet. Deposit still works.");
+    return;
+  }
+  user.balanceCents -= need;
+  const purchase = {
+    id: nextId(),
+    chatId: ctx.chat.id,
+    denom,
+    retailCents: need,
+    status: /** @type {PurchaseStatus} */ ("pending"),
+    createdAt: Date.now(),
+  };
+  desk.purchases.set(purchase.id, purchase);
+  await save({ users: [user], purchases: [purchase] });
+  await ctx.reply(`Buying Razer Gold US · $${denom} from Fazer…`);
   try {
-    await bot.api.sendMessage(ADMIN_ID, text, extra);
+    const card = await buyRazerPin(denom, purchase.id);
+    purchase.status = "delivered";
+    purchase.pin = card.pin;
+    purchase.serial = card.serial;
+    purchase.fazerOrderId = card.orderId;
+    purchase.costUsd = card.costUsd;
+    await save({ purchases: [purchase] });
+    await ctx.reply(
+      [
+        "Your PIN is below — keep this message.",
+        "",
+        `Razer Gold US · $${denom}`,
+        `PIN: \`${prettyPin(card.pin)}\``,
+        `Serial: \`${card.serial}\``,
+        "",
+        `Spent ${money(need)} USDT. Balance: ${money(user.balanceCents)} USDT`,
+        "",
+        "Redeem at gold.razer.com → Reload → Razer Gold PIN.",
+      ].join("\n"),
+      { parse_mode: "Markdown", reply_markup: homeKb() },
+    );
+    await notifyAdmin(
+      `Sold $${denom} to @${user.username}\n${purchase.id}\nFazer ${card.orderId || ""} · cost ${card.costUsd || "?"} USD`,
+    );
   } catch (err) {
-    console.error("admin notify failed", err instanceof Error ? err.message : err);
+    user.balanceCents += need;
+    purchase.status = "failed";
+    await save({ users: [user], purchases: [purchase] });
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error("fazer buy failed", msg);
+    await ctx.reply(
+      `Could not pull $${denom} from Fazer yet. Your ${money(need)} USDT is back on the balance (${money(user.balanceCents)}).\n\nThe desk will fund Fazer and you can tap Buy again.`,
+      { reply_markup: homeKb() },
+    );
+    await notifyAdmin(`Fazer buy failed for @${user.username} $${denom}\n${purchase.id}\n${msg}\n\nFund Fazer, then they can retry.`);
   }
 }
 
@@ -273,83 +457,155 @@ if (bot) {
   });
 
   bot.command("start", async (ctx) => {
+    ensureUser(ctx.chat.id, ctx.from?.username || String(ctx.from?.id));
     await sendHome(
       ctx,
-      "Goldroom\nPrivate desk for Razer Gold US.\n\nPay in USDT on BEP20. PIN arrives in this chat.\nTap below to buy.",
+      "Goldroom\nPrivate desk for Razer Gold US.\n\n1. Deposit USDT on BEP20.\n2. The desk funds Fazer, then credits your balance.\n3. Buy a PIN with that balance.\n\nTap Deposit to start.",
     );
   });
 
   bot.command("help", async (ctx) => {
     await ctx.reply(
-      "Four steps.\n\n1. Pick a Razer Gold US amount.\n2. Pay in USDT on BEP20 (BNB Smart Chain — not TRC20, not ERC20).\n3. Send the exact amount shown — the extra cents are how we match your payment.\n4. Tap I’ve paid. The PIN lands in this chat after the desk confirms.\n\nRedeem at gold.razer.com → Reload → Razer Gold PIN.\nUS PINs only. No refunds once the code is revealed.",
+      "How this desk works.\n\n1. Deposit USDT on BEP20 (exact amount with matching cents).\n2. The desk sends that USDT to FazerCards.\n3. After Fazer is funded, your Goldroom balance is credited.\n4. Buy Razer Gold US up to your balance. The PIN is pulled from Fazer and lands here.\n\nRedeem at gold.razer.com → Reload → Razer Gold PIN.\nNo refunds once a code is revealed.",
       { reply_markup: homeKb() },
     );
   });
 
-  bot.command("stock", async (ctx) => {
+  bot.command("balance", async (ctx) => {
+    const user = ensureUser(ctx.chat.id, ctx.from?.username || String(ctx.from?.id));
+    let extra = "";
+    if (isAdmin(ctx) && fazerConfigured()) {
+      try {
+        const f = await fazerBalance();
+        extra = `\n\nFazer supplier: ${f.balance} ${f.currency}`;
+      } catch (err) {
+        extra = `\n\nFazer: ${err.message || err}`;
+      }
+    }
+    await ctx.reply(`Goldroom balance: ${money(user.balanceCents)} USDT${extra}`, {
+      reply_markup: homeKb(),
+    });
+  });
+
+  bot.command("catalog", async (ctx) => {
     if (!isAdmin(ctx)) {
       await ctx.reply("Not for buyers.");
       return;
     }
-    const body = (ctx.match || "").trim();
-    if (!body) {
-      const lines = DENOMS.map((d) => `$${d}  ·  ${stockCount(d)} in stock`).join("\n");
-      await ctx.reply(
-        `Stock\n${lines}\n\nAdd PINs with:\n/stock 25 PIN SERIAL\nOne per line after the command.`,
-      );
+    try {
+      const cat = await razerCatalog();
+      if (!cat.categoryId) {
+        const names = cat.hits.map((h) => `${h.category_id}  ·  ${h.name}`).join("\n") || "none";
+        await ctx.reply(`No Razer category matched.\nHits:\n${names}\n\nSet FAZER_CATEGORY_ID.`);
+        return;
+      }
+      const lines = DENOMS.map((d) => {
+        const o = matchOffer(cat.offers, d);
+        return o
+          ? `$${d}  ·  ${o.card_id}  ·  ${o.price_usd || o.price} USD`
+          : `$${d}  ·  no offer`;
+      }).join("\n");
+      await ctx.reply(`Fazer category: ${cat.categoryId}\n${lines}`);
+    } catch (err) {
+      await ctx.reply(`Fazer catalog failed: ${err.message || err}`);
+    }
+  });
+
+  bot.command("credit", async (ctx) => {
+    if (!isAdmin(ctx)) {
+      await ctx.reply("Not for buyers.");
       return;
     }
-    const rows = body.split(/\n+/).map((l) => l.trim()).filter(Boolean);
-    let added = 0;
-    const errors = [];
-    const fresh = [];
-    for (const line of rows) {
-      const parts = line.split(/[,\s|]+/).filter(Boolean);
-      const denom = Number(parts[0]);
-      const pin = parts[1];
-      const serial = parts[2] || nid("SN");
-      if (!DENOMS.includes(denom) || !pin) {
-        errors.push(line);
-        continue;
-      }
-      const row = {
-        id: nid("pin"),
-        denom,
-        pin,
-        serial,
-        status: /** @type {PinStatus} */ ("stock"),
-      };
-      desk.pins.push(row);
-      fresh.push(row);
-      added += 1;
+    const parts = (ctx.match || "").trim().split(/\s+/);
+    const who = parts[0];
+    const amount = Number(parts[1]);
+    if (!who || !Number.isFinite(amount) || amount <= 0) {
+      await ctx.reply("Usage: /credit 123456789 25.00\nNumeric Telegram id, then USDT.");
+      return;
     }
-    if (fresh.length) await save(fresh, []);
-    await ctx.reply(
-      added ? `Added ${added} PIN${added === 1 ? "" : "s"}.` : "Nothing added.",
-    );
-    if (errors.length) await ctx.reply(`Skipped:\n${errors.join("\n")}`);
+    const chatId = Number(who.replace(/^@/, ""));
+    if (!chatId) {
+      await ctx.reply("Use the numeric Telegram id from the deposit message.");
+      return;
+    }
+    const user = ensureUser(chatId, who);
+    user.balanceCents += centsOf(amount.toFixed(2));
+    await save({ users: [user] });
+    await ctx.reply(`Credited ${amount.toFixed(2)} USDT. Balance ${money(user.balanceCents)}.`);
+    try {
+      await bot.api.sendMessage(
+        chatId,
+        `The desk credited ${amount.toFixed(2)} USDT. Balance: ${money(user.balanceCents)} USDT.`,
+        { reply_markup: homeKb() },
+      );
+    } catch {
+      /* user may not have started */
+    }
   });
 
   bot.command("orders", async (ctx) => {
-    const mine = [...desk.orders.values()]
-      .filter((o) => (isAdmin(ctx) ? true : o.chatId === ctx.chat.id))
-      .slice(-8)
+    const mineDep = [...desk.deposits.values()]
+      .filter((d) => (isAdmin(ctx) ? true : d.chatId === ctx.chat.id))
+      .slice(-6)
       .reverse();
-    const lines =
-      mine.length === 0
-        ? "No orders yet."
-        : mine.map((o) => `${o.id}  ·  $${o.denom}  ·  ${o.status}`).join("\n");
+    const mineBuy = [...desk.purchases.values()]
+      .filter((p) => (isAdmin(ctx) ? true : p.chatId === ctx.chat.id))
+      .slice(-6)
+      .reverse();
+    const lines = [
+      mineDep.length ? "Deposits" : "No deposits.",
+      ...mineDep.map((d) => `${d.id}  ·  ${d.payAmount} ${d.payAsset}  ·  ${d.status}`),
+      "",
+      mineBuy.length ? "Cards" : "No cards yet.",
+      ...mineBuy.map((p) => `${p.id}  ·  $${p.denom}  ·  ${p.status}`),
+    ].join("\n");
     await ctx.reply(lines, { reply_markup: homeKb() });
   });
 
-  bot.callbackQuery(/^confirm:(.+)$/, async (ctx) => {
+  bot.callbackQuery(/^paid:(.+)$/, async (ctx) => {
+    const id = ctx.match[1];
+    const d = desk.deposits.get(id);
+    if (!d || d.chatId !== ctx.chat.id) {
+      await ctx.answerCallbackQuery({ text: "Not found" });
+      return;
+    }
+    if (d.status !== "awaiting") {
+      await ctx.answerCallbackQuery({ text: "Already moving" });
+      return;
+    }
+    d.status = "checking";
+    await save({ deposits: [d] });
+    await ctx.answerCallbackQuery();
+    await ctx.reply("Payment flagged. The desk will fund Fazer, then credit your balance.");
+    const kb = new InlineKeyboard()
+      .text("Credit balance", `credit:${d.id}`)
+      .row()
+      .text("Reject", `reject:${d.id}`);
+    await notifyAdmin(
+      [
+        "Deposit claimed — fund Fazer first",
+        `${d.id}  ·  ${d.payAmount} USDT BEP20`,
+        `@${d.username}  ·  id ${d.chatId}`,
+        "",
+        "1. Send USDT to FazerCards on BEP20.",
+        "2. When Fazer shows the balance, tap Credit.",
+      ].join("\n"),
+      { reply_markup: kb },
+    );
+  });
+
+  bot.callbackQuery(/^credit:(.+)$/, async (ctx) => {
     if (!isAdmin(ctx)) {
       await ctx.answerCallbackQuery({ text: "Desk only" });
       return;
     }
-    const orderId = ctx.match[1];
-    const result = await deliverOrder(ctx, orderId);
+    const result = await creditDeposit(ctx.match[1]);
     await ctx.answerCallbackQuery({ text: result });
+    try {
+      await ctx.editMessageText(`${ctx.match[1]} ${result.toLowerCase()}.`);
+    } catch {
+      /* ignore */
+    }
   });
 
   bot.callbackQuery(/^reject:(.+)$/, async (ctx) => {
@@ -357,81 +613,94 @@ if (bot) {
       await ctx.answerCallbackQuery({ text: "Desk only" });
       return;
     }
-    const orderId = ctx.match[1];
-    const order = desk.orders.get(orderId);
-    if (!order || (order.status !== "awaiting" && order.status !== "checking")) {
+    const d = desk.deposits.get(ctx.match[1]);
+    if (!d || (d.status !== "awaiting" && d.status !== "checking")) {
       await ctx.answerCallbackQuery({ text: "Already closed" });
       return;
     }
-    order.status = "cancelled";
-    const pin = desk.pins.find((p) => p.id === order.pinId);
-    if (pin) {
-      pin.status = "stock";
-      pin.orderId = undefined;
-    }
-    await save(pin ? [pin] : [], [order]);
+    d.status = "cancelled";
+    await save({ deposits: [d] });
     await ctx.answerCallbackQuery({ text: "Rejected" });
-    await bot.api.sendMessage(order.chatId, `${orderId} was not confirmed. Nothing was sent.`, {
+    await bot.api.sendMessage(d.chatId, `${d.id} was not credited. Nothing added.`, {
       reply_markup: homeKb(),
     });
-    await ctx.editMessageText(`${orderId} rejected.`);
-  });
-
-  bot.callbackQuery(/^paid:(.+)$/, async (ctx) => {
-    const orderId = ctx.match[1];
-    await markPaid(ctx, orderId);
-    await ctx.answerCallbackQuery();
+    try {
+      await ctx.editMessageText(`${d.id} rejected.`);
+    } catch {
+      /* ignore */
+    }
   });
 
   bot.callbackQuery(/^cancel:(.+)$/, async (ctx) => {
-    const orderId = ctx.match[1];
-    const order = desk.orders.get(orderId);
-    if (!order || order.chatId !== ctx.chat.id) {
+    const d = desk.deposits.get(ctx.match[1]);
+    if (!d || d.chatId !== ctx.chat.id) {
       await ctx.answerCallbackQuery({ text: "Not found" });
       return;
     }
-    if (order.status !== "awaiting" && order.status !== "checking") {
+    if (d.status !== "awaiting" && d.status !== "checking") {
       await ctx.answerCallbackQuery({ text: "Already closed" });
       return;
     }
-    order.status = "cancelled";
-    const pin = desk.pins.find((p) => p.id === order.pinId);
-    if (pin) {
-      pin.status = "stock";
-      pin.orderId = undefined;
-    }
+    d.status = "cancelled";
     sessionOf(ctx.chat.id).screen = "home";
-    await save(pin ? [pin] : [], [order]);
+    await save({ deposits: [d] });
     await ctx.answerCallbackQuery({ text: "Cancelled" });
-    await ctx.reply(`${orderId} cancelled. Nothing was sent.`, { reply_markup: homeKb() });
+    await ctx.reply(`${d.id} cancelled. Nothing was credited.`, { reply_markup: homeKb() });
   });
 
   bot.on("message:text", async (ctx) => {
     const text = ctx.message.text.trim();
     if (text.startsWith("/")) return;
-
     await expireStale();
+    const sess = sessionOf(ctx.chat.id);
+    const user = ensureUser(ctx.chat.id, ctx.from?.username || String(ctx.from?.id));
 
+    if (text === "Deposit") {
+      sess.screen = "deposit";
+      await ctx.reply(
+        "Pick how much USDT to load.\n\nYou can also type an amount, like 40 USDT.\nMatching cents are added so the desk can identify your payment.",
+        { reply_markup: depositKb() },
+      );
+      return;
+    }
     if (text === "Buy Razer Gold" || text === "Amounts") {
-      await sendCatalog(ctx);
+      sess.screen = "catalog";
+      const body =
+        user.balanceCents <= 0
+          ? "Balance is 0.00 USDT.\nDeposit first. After the desk funds Fazer, you can buy."
+          : `Razer Gold · United States\nBalance: ${money(user.balanceCents)} USDT\n\nPINs come from Fazer after you pick an amount you can afford.`;
+      await ctx.reply(body, { reply_markup: catalogKb(user.balanceCents) });
+      return;
+    }
+    if (text === "Balance") {
+      await ctx.reply(`Goldroom balance: ${money(user.balanceCents)} USDT`, {
+        reply_markup: homeKb(),
+      });
       return;
     }
     if (text === "Help") {
       await ctx.reply(
-        "Four steps.\n\n1. Pick a Razer Gold US amount.\n2. Pay in USDT on BEP20 (BNB Smart Chain — not TRC20, not ERC20).\n3. Send the exact amount shown — the extra cents are how we match your payment.\n4. Tap I’ve paid. The PIN lands in this chat after the desk confirms.\n\nRedeem at gold.razer.com → Reload → Razer Gold PIN.",
+        "1. Deposit USDT on BEP20.\n2. Desk funds Fazer, then credits you.\n3. Buy Razer Gold US with that balance.\n4. PIN arrives in this chat.\n\nBEP20 only — not TRC20, not ERC20.",
         { reply_markup: homeKb() },
       );
       return;
     }
     if (text === "Orders") {
-      const mine = [...desk.orders.values()]
-        .filter((o) => o.chatId === ctx.chat.id)
-        .slice(-8)
+      const mineDep = [...desk.deposits.values()]
+        .filter((d) => d.chatId === ctx.chat.id)
+        .slice(-6)
         .reverse();
-      const lines =
-        mine.length === 0
-          ? "No orders yet."
-          : mine.map((o) => `${o.id}  ·  $${o.denom}  ·  ${o.status}`).join("\n");
+      const mineBuy = [...desk.purchases.values()]
+        .filter((p) => p.chatId === ctx.chat.id)
+        .slice(-6)
+        .reverse();
+      const lines = [
+        mineDep.length ? "Deposits" : "No deposits.",
+        ...mineDep.map((d) => `${d.id}  ·  ${d.payAmount}  ·  ${d.status}`),
+        "",
+        mineBuy.length ? "Cards" : "No cards yet.",
+        ...mineBuy.map((p) => `${p.id}  ·  $${p.denom}  ·  ${p.status}`),
+      ].join("\n");
       await ctx.reply(lines, { reply_markup: homeKb() });
       return;
     }
@@ -439,93 +708,20 @@ if (bot) {
       await sendHome(ctx, "What do you need?");
       return;
     }
-    if (text === "Buy another") {
-      await sendCatalog(ctx);
+
+    const dep = parseDepositLabel(text);
+    if (dep != null || (sess.screen === "deposit" && Number(text) > 0)) {
+      await startDeposit(ctx, dep ?? Number(text));
       return;
     }
 
     const denom = parseDenomLabel(text);
     if (denom) {
-      if (stockCount(denom) === 0) {
-        await ctx.reply(`$${denom} is out of stock. Pick another amount.`, {
-          reply_markup: catalogKb(),
-        });
-        return;
-      }
-      const sess = sessionOf(ctx.chat.id);
-      sess.screen = "network";
-      sess.denom = denom;
-      const usdt = PRICES[denom].toFixed(2);
-      await ctx.reply(
-        `Razer Gold US · $${denom}\nYou pay ${usdt} USDT on BEP20 (plus matching cents).\n\nPrice includes the desk fee. Nothing extra at payment.\n\nBEP20 only — TRC20 or ERC20 will not arrive.`,
-        { reply_markup: networkKb() },
-      );
+      await buyCard(ctx, denom);
       return;
     }
 
-    if (text === "USDT · BEP20" || text === "Bitcoin") {
-      const sess = sessionOf(ctx.chat.id);
-      const d = sess.denom;
-      if (!d) {
-        await sendCatalog(ctx);
-        return;
-      }
-      const network = text === "Bitcoin" ? "btc" : "usdt-bep20";
-      const address = network === "btc" ? WALLET_BTC : WALLET_BEP20;
-      if (!address) {
-        await ctx.reply("That wallet is not set on the desk yet. Use USDT · BEP20.");
-        return;
-      }
-      const pin = desk.pins.find((p) => p.status === "stock" && p.denom === d);
-      if (!pin) {
-        await sendCatalog(ctx, `$${d} is out of stock. Pick another amount.`);
-        return;
-      }
-      const pay = uniqueAmount(PRICES[d], desk.seq, network);
-      const order = {
-        id: nextOrderId(),
-        chatId: ctx.chat.id,
-        username: ctx.from?.username || String(ctx.from?.id),
-        denom: d,
-        network,
-        payAmount: pay.amount,
-        payAsset: pay.asset,
-        address,
-        status: /** @type {OrderStatus} */ ("awaiting"),
-        pinId: pin.id,
-        createdAt: Date.now(),
-        expiresAt: Date.now() + ORDER_TTL_MS,
-      };
-      pin.status = "reserved";
-      pin.orderId = order.id;
-      desk.orders.set(order.id, order);
-      sess.screen = "pay";
-      sess.orderId = order.id;
-      await save([pin], [order]);
-
-      const payKb = new InlineKeyboard()
-        .text("I’ve paid", `paid:${order.id}`)
-        .row()
-        .text("Cancel", `cancel:${order.id}`);
-
-      await ctx.reply(
-        [
-          `Send exactly ${pay.amount} ${pay.asset}`,
-          `Network: ${pay.asset} · ${network === "btc" ? "BTC" : "BEP20"}`,
-          `Order: ${order.id}`,
-          "",
-          "To:",
-          `\`${address}\``,
-          "",
-          "BEP20 USDT only. TRC20 or ERC20 will not land.",
-          "Send the exact amount — matching cents identify this order.",
-        ].join("\n"),
-        { parse_mode: "Markdown", reply_markup: payKb },
-      );
-      return;
-    }
-
-    await ctx.reply("Use the buttons below, or type buy, orders, or help.", {
+    await ctx.reply("Use the buttons below, or type deposit, buy, balance, or help.", {
       reply_markup: homeKb(),
     });
   });
@@ -533,69 +729,6 @@ if (bot) {
   bot.catch((err) => {
     console.error("bot error", err.error?.description || err.message || err);
   });
-}
-
-async function markPaid(ctx, orderId) {
-  const order = desk.orders.get(orderId);
-  if (!order || order.chatId !== ctx.chat.id) {
-    await ctx.reply("Order not found.");
-    return;
-  }
-  if (order.status !== "awaiting") {
-    await ctx.reply("This order is already moving.");
-    return;
-  }
-  order.status = "checking";
-  await save([], [order]);
-  const payKb = new InlineKeyboard()
-    .text("Confirm + send PIN", `confirm:${order.id}`)
-    .row()
-    .text("Reject", `reject:${order.id}`);
-  await ctx.reply("Payment flagged. The desk will confirm and send your PIN here.");
-  await notifyAdmin(
-    bot,
-    [
-      "Payment claimed",
-      `${order.id}  ·  $${order.denom}`,
-      `${order.payAmount} ${order.payAsset}  ·  ${order.network === "btc" ? "BTC" : "BEP20"}`,
-      `@${order.username}`,
-      "",
-      "Check the wallet, then confirm.",
-    ].join("\n"),
-    { reply_markup: payKb },
-  );
-}
-
-async function deliverOrder(ctx, orderId) {
-  const order = desk.orders.get(orderId);
-  if (!order) return "Not found";
-  if (order.status === "delivered") return "Already sent";
-  if (order.status !== "checking" && order.status !== "awaiting") return "Closed";
-  const pin = desk.pins.find((p) => p.id === order.pinId);
-  if (!pin) return "No PIN";
-  order.status = "delivered";
-  order.deliveredAt = Date.now();
-  pin.status = "sold";
-  await save([pin], [order]);
-  await bot.api.sendMessage(
-    order.chatId,
-    [
-      "Payment received. Your PIN is below — keep this message.",
-      "",
-      `Razer Gold US · $${order.denom}`,
-      `PIN: \`${prettyPin(pin.pin)}\``,
-      `Serial: \`${pin.serial}\``,
-      "",
-      "Redeem at gold.razer.com → Reload → Razer Gold PIN.",
-    ].join("\n"),
-    { parse_mode: "Markdown", reply_markup: homeKb() },
-  );
-  try {
-    await ctx.editMessageText(`${orderId} delivered.`);
-  } catch {
-    /* message may not be editable */
-  }
-  return "Sent";
 }
 
 const server = http.createServer((req, res) => {
@@ -609,8 +742,9 @@ const server = http.createServer((req, res) => {
         wallet: Boolean(WALLET_BEP20),
         admin: Boolean(ADMIN_ID),
         supabase: Boolean(db),
+        fazer: fazerConfigured(),
         ready: desk.ready,
-        stock: desk.pins.filter((p) => p.status === "stock").length,
+        users: desk.users.size,
       }),
     );
     return;
@@ -627,8 +761,8 @@ server.listen(PORT, "0.0.0.0", async () => {
     onStart: (info) => {
       console.log(`goldroom bot @${info.username} polling`);
       if (!WALLET_BEP20) console.warn("WALLET_USDT_BEP20 is not set");
-      if (!ADMIN_ID) console.warn("ADMIN_TELEGRAM_ID is not set — payments cannot be confirmed");
-      if (!db) console.warn("Supabase is not set — stock dies on restart");
+      if (!ADMIN_ID) console.warn("ADMIN_TELEGRAM_ID is not set");
+      if (!fazerConfigured()) console.warn("CARD_API_KEY is not set — buys cannot hit Fazer");
     },
   });
 });

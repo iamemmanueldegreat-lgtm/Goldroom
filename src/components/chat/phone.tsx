@@ -202,13 +202,13 @@ function PinCard({ order }: { order: Order }) {
   return (
     <div className="mt-3 space-y-2 rounded-md bg-bg-elevated p-3 shadow-[var(--shadow-border)]">
       <p className="text-[11px] uppercase tracking-wider text-brass">
-        Razer Gold US · ${order.denom}
+        Razer Gold US{order.denom ? ` · $${order.denom}` : ""}
       </p>
       <CopyRow label="PIN" value={prettyPin(order.pin)} raw={order.pin} />
       {order.serial && <CopyRow label="Serial" value={order.serial} />}
       <p className="pt-1 text-[11px] leading-snug text-subtle">
-        Demo PIN — not redeemable. Live desk delivers a real Razer code after
-        chain confirm.
+        Demo PIN — not redeemable. Live desk pulls a real Razer code from Fazer
+        after your Goldroom balance is credited.
       </p>
     </div>
   );

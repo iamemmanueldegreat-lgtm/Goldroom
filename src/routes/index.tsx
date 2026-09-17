@@ -8,7 +8,7 @@ import { formatUsd } from "@/lib/utils";
 export const Route = createFileRoute("/")({ component: Home });
 
 function Home() {
-  const stock = useShop((s) => s.pins.filter((p) => p.status === "stock").length);
+  const balanceCents = useShop((s) => s.balanceCents);
   const prices = useShop((s) => s.settings.prices);
 
   return (
@@ -22,27 +22,27 @@ function Home() {
             Razer Gold US, paid in crypto, delivered in chat.
           </h1>
           <p className="mt-5 text-base leading-relaxed text-muted">
-            Goldroom is a quiet shop for a small group. Buy a PIN, send USDT on
-            BEP20, and the code arrives in the conversation. Same flow your
-            Telegram bot will use.
+            Goldroom is a quiet shop for a small group. Deposit USDT on BEP20,
+            the desk funds Fazer, then you buy a Razer Gold US PIN from your
+            balance. Same flow as the Telegram bot.
           </p>
 
           <ol className="mt-8 space-y-4">
             {[
               {
                 n: "01",
-                t: "Pick an amount",
-                d: "Razer Gold US from $10 to $100. Stock is live in the chat.",
+                t: "Deposit USDT",
+                d: "Send the exact BEP20 amount. Matching cents identify the deposit.",
               },
               {
                 n: "02",
-                t: "Send the exact amount",
-                d: "USDT on BEP20. Matching cents identify the order. Not TRC20, not ERC20.",
+                t: "Desk funds Fazer",
+                d: "After the supplier balance is up, your Goldroom balance is credited.",
               },
               {
                 n: "03",
-                t: "PIN in the thread",
-                d: "After payment confirms, the serial and PIN land once in chat.",
+                t: "Buy a PIN",
+                d: "Spend that balance on Razer Gold US. The code lands in chat.",
               },
             ].map((step) => (
               <li key={step.n} className="flex gap-4">
@@ -59,9 +59,9 @@ function Home() {
 
           <div className="mt-10 rounded-xl bg-bg-elevated p-4 shadow-[var(--shadow-border)] sm:p-5">
             <div className="flex items-center justify-between gap-3">
-              <p className="text-sm font-medium">On the shelf</p>
+              <p className="text-sm font-medium">Desk prices</p>
               <p className="font-mono text-xs tabular-nums text-muted">
-                {stock} PINs
+                {(balanceCents / 100).toFixed(2)} USDT on the book
               </p>
             </div>
             <ul className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-5">
