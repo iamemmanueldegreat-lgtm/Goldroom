@@ -1,0 +1,13 @@
+node_modules
+bot/node_modules
+.vercel
+.output
+.nitro
+.git
+screenshots
+artifacts
+src
+scripts
+public
+migrations
+server
