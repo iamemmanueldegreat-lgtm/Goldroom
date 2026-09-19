@@ -54,6 +54,7 @@ const desk = {
   purchases: new Map(),
   /** @type {Map<number, {screen: string, denom?: number, depositId?: string, depositAmount?: string}>} */
   sessions: new Map(),
+  adminReplyTo: 0,
 };
 
 function nid(prefix) {
@@ -264,8 +265,121 @@ function homeKb() {
     .text("Balance")
     .text("Orders")
     .row()
+    .text("Support")
     .text("Help")
     .resized();
+}
+
+function supportKb() {
+  return new Keyboard()
+    .text("Deposit help")
+    .text("Buy a card")
+    .row()
+    .text("Redeem PIN")
+    .text("My order")
+    .row()
+    .text("Talk to a person")
+    .row()
+    .text("Back")
+    .resized();
+}
+
+function supportSnapshot(chatId) {
+  const user = desk.users.get(chatId);
+  const deps = [...desk.deposits.values()].filter((d) => d.chatId === chatId).slice(-3).reverse();
+  const buys = [...desk.purchases.values()].filter((p) => p.chatId === chatId).slice(-3).reverse();
+  const pending = pendingBuy(chatId);
+  const waiting = [...desk.deposits.values()].find(
+    (d) => d.chatId === chatId && (d.status === "awaiting" || d.status === "checking"),
+  );
+  return { user, deps, buys, pending, waiting };
+}
+
+function supportFaq(text, chatId) {
+  const t = String(text || "").toLowerCase();
+  if (/talk to a person|human|agent|specialist|complaint|manager|staff|real person/.test(t)) return null;
+  if (/(deposit|payment|usdt).*(not|no|never|didn't|didnt|still|waiting|delay|pending|arriv|missing|reflect)/.test(t)) return null;
+  if (/(paid|sent).*(not|no|still|waiting)/.test(t)) return null;
+  if (/refund|scam|stolen|wrong pin|invalid pin|didn't get|didnt get|no pin|no code/.test(t)) return null;
+  if (t === "my order" || /where.*order|order status|my (pin|card|code)/.test(t)) {
+    const snap = supportSnapshot(chatId);
+    if (snap.pending) {
+      return "Your card is still being issued. Stay in this chat — the PIN will arrive here. Do not place another order.";
+    }
+    const last = snap.buys[0];
+    if (last && last.status === "delivered") {
+      return `Your latest card is $${last.denom} (${last.id}). Check this chat for the PIN and the downloadable file. Redeem at gold.razer.com → Reload → Razer Gold PIN.`;
+    }
+    if (snap.waiting) {
+      return `We see deposit ${snap.waiting.id} for ${snap.waiting.payAmount} USDT. It credits automatically after confirmation. If this is taking longer than usual, a specialist will review it.`;
+    }
+    return "We don't see an open order. Use Deposit to add funds, then Buy Razer Gold.";
+  }
+  if (t === "deposit help" || /how.*deposit|deposit.*work|send.*usdt|which network|bep20|aptos/.test(t)) {
+    return "How to deposit\n\n1. Tap Deposit and enter an amount.\n2. Choose BEP20 or Aptos.\n3. Send the exact USDT amount shown. Network fees are paid from your wallet.\n4. Your Goldroom balance updates after confirmation.\n\nUse only the network printed on that deposit.";
+  }
+  if (t === "buy a card" || /how.*buy|buy.*card|purchase|price/.test(t)) {
+    return "How to buy\n\n1. Deposit USDT so you have a Goldroom balance.\n2. Tap Buy Razer Gold and choose an amount you can afford.\n3. Confirm. Your PIN arrives in this chat and as a .txt file.\n\nDo not buy again while an order is processing.";
+  }
+  if (t === "redeem pin" || /redeem|razer\.com|how.*use|where.*use/.test(t)) {
+    return "Redeem at gold.razer.com → Reload → Razer Gold PIN.\nEnter the code exactly as sent. Codes are final once revealed.";
+  }
+  if (/txt|file|download/.test(t)) {
+    return "Each PIN is sent as a chat message and a .txt file. The code in both should match. The file name includes your order id so later cards don't overwrite earlier ones.";
+  }
+  if (/balance/.test(t)) {
+    const user = desk.users.get(chatId);
+    return `Your Goldroom balance is ${money(user?.balanceCents || 0)} USDT.`;
+  }
+  if (/how long|confirm|how (fast|soon)|when.*credit/.test(t)) {
+    return "Most deposits credit automatically after the network confirms. Time varies by network. If a deposit is taking longer than usual, a specialist will review it.";
+  }
+  if (/minimum|min deposit/.test(t)) {
+    return "Type the amount you want, then pick a network. If the amount is below that network's minimum, we'll tell you the minimum before you send.";
+  }
+  return undefined;
+}
+
+async function escalateSupport(ctx, text) {
+  const chatId = ctx.chat.id;
+  const user = ensureUser(chatId, ctx.from?.username || String(ctx.from?.id));
+  const snap = supportSnapshot(chatId);
+  const kb = new InlineKeyboard()
+    .text("Reply", `supreply:${chatId}`)
+    .text("Close", `supclose:${chatId}`);
+  await notifyAdmin(
+    [
+      "Support ticket",
+      `@${user.username || "—"}  ·  id ${chatId}`,
+      `Balance ${money(user.balanceCents)} USDT`,
+      snap.waiting ? `Open deposit ${snap.waiting.id}  ·  ${snap.waiting.payAmount}  ·  ${snap.waiting.status}` : "No open deposit",
+      snap.pending ? `Open card $${snap.pending.denom}  ·  ${snap.pending.id}` : "No open card",
+      "",
+      text,
+    ].join("\n"),
+    { reply_markup: kb },
+  );
+  await ctx.reply(
+    "A Goldroom specialist will be assigned to you shortly. Keep this chat open — we'll reply here.",
+    { reply_markup: supportKb() },
+  );
+}
+
+async function openSupport(ctx) {
+  sessionOf(ctx.chat.id).screen = "support";
+  await ctx.reply(
+    "Goldroom Support\n\nAsk a question, or pick a topic. For anything we can't settle here, a specialist is assigned to you.",
+    { reply_markup: supportKb() },
+  );
+}
+
+async function handleSupportText(ctx, text) {
+  const faq = supportFaq(text, ctx.chat.id);
+  if (faq) {
+    await ctx.reply(faq, { reply_markup: supportKb() });
+    return;
+  }
+  await escalateSupport(ctx, text);
 }
 
 function depositKb() {
@@ -798,9 +912,40 @@ if (bot) {
 
   bot.command("help", async (ctx) => {
     await ctx.reply(
-      "Buy Razer Gold US in three steps.\n\n1. Deposit USDT on BEP20 or Aptos — send the exact amount shown.\n2. When your balance updates, tap Buy Razer Gold.\n3. Your PIN arrives in this chat.\n\nRedeem at gold.razer.com → Reload → Razer Gold PIN.\nCodes are final once revealed.",
+      "Buy Razer Gold US in three steps.\n\n1. Deposit USDT on BEP20 or Aptos — send the exact amount shown.\n2. When your balance updates, tap Buy Razer Gold.\n3. Your PIN arrives in this chat.\n\nRedeem at gold.razer.com → Reload → Razer Gold PIN.\nCodes are final once revealed.\n\nNeed help? Tap Support.",
       { reply_markup: homeKb() },
     );
+  });
+
+  bot.command("done", async (ctx) => {
+    if (!isAdmin(ctx)) return;
+    desk.adminReplyTo = 0;
+    await ctx.reply("Reply mode off.");
+  });
+
+  bot.command("reply", async (ctx) => {
+    if (!isAdmin(ctx)) {
+      await ctx.reply("Not for buyers.");
+      return;
+    }
+    const parts = (ctx.match || "").trim().split(/\s+/);
+    const chatId = Number(parts[0]);
+    const msg = parts.slice(1).join(" ");
+    if (!chatId) {
+      await ctx.reply("Usage: /reply 123456789 your message");
+      return;
+    }
+    if (!msg) {
+      desk.adminReplyTo = chatId;
+      await ctx.reply(`Next messages go to ${chatId}. /done to stop.`);
+      return;
+    }
+    try {
+      await bot.api.sendMessage(chatId, msg, { reply_markup: supportKb() });
+      await ctx.reply("Sent.");
+    } catch (err) {
+      await ctx.reply(`Could not send: ${err instanceof Error ? err.message : err}`);
+    }
   });
 
   bot.command("balance", async (ctx) => {
@@ -996,6 +1141,36 @@ if (bot) {
     await ctx.reply("Choose an amount.", { reply_markup: catalogKb(user.balanceCents) });
   });
 
+  bot.callbackQuery(/^supreply:(\d+)$/, async (ctx) => {
+    if (!isAdmin(ctx)) {
+      await ctx.answerCallbackQuery({ text: "Desk only" });
+      return;
+    }
+    desk.adminReplyTo = Number(ctx.match[1]);
+    await ctx.answerCallbackQuery({ text: "Reply mode" });
+    await ctx.reply(`Next messages go to ${desk.adminReplyTo}. Send /done when finished.`);
+  });
+
+  bot.callbackQuery(/^supclose:(\d+)$/, async (ctx) => {
+    if (!isAdmin(ctx)) {
+      await ctx.answerCallbackQuery({ text: "Desk only" });
+      return;
+    }
+    const chatId = Number(ctx.match[1]);
+    if (desk.adminReplyTo === chatId) desk.adminReplyTo = 0;
+    await ctx.answerCallbackQuery({ text: "Closed" });
+    try {
+      await bot.api.sendMessage(
+        chatId,
+        "Your support ticket is closed. Tap Support anytime if you need us again.",
+        { reply_markup: homeKb() },
+      );
+    } catch {
+      /* ignore */
+    }
+    await ctx.reply(`Closed ${chatId}.`);
+  });
+
   bot.callbackQuery(/^paid:(.+)$/, async (ctx) => {
     const id = ctx.match[1];
     const d = desk.deposits.get(id);
@@ -1080,9 +1255,32 @@ if (bot) {
     const text = ctx.message.text.trim();
     if (text.startsWith("/")) return;
     await expireStale();
+    if (isAdmin(ctx) && desk.adminReplyTo && !["Deposit", "Buy Razer Gold", "Balance", "Orders", "Help", "Support", "Back", "Menu"].includes(text)) {
+      const to = desk.adminReplyTo;
+      try {
+        await bot.api.sendMessage(to, text, { reply_markup: supportKb() });
+        await ctx.reply(`Sent to ${to}. Send another message, or /done to stop.`);
+      } catch (err) {
+        await ctx.reply(`Could not send: ${err instanceof Error ? err.message : err}`);
+      }
+      return;
+    }
     const sess = sessionOf(ctx.chat.id);
     const user = ensureUser(ctx.chat.id, ctx.from?.username || String(ctx.from?.id));
 
+    if (text === "Support") {
+      await openSupport(ctx);
+      return;
+    }
+    if (text === "Deposit help" || text === "Buy a card" || text === "Redeem PIN" || text === "My order" || text === "Talk to a person") {
+      sess.screen = "support";
+      await handleSupportText(ctx, text);
+      return;
+    }
+    if (sess.screen === "support") {
+      await handleSupportText(ctx, text);
+      return;
+    }
     if (text === "Deposit") {
       sess.screen = "deposit";
       await ctx.reply(
@@ -1172,7 +1370,7 @@ if (bot) {
       return;
     }
 
-    await ctx.reply("Use the buttons below, or type deposit, buy, balance, or help.", {
+    await ctx.reply("Use the buttons below, or type deposit, buy, balance, support, or help.", {
       reply_markup: homeKb(),
     });
   });
