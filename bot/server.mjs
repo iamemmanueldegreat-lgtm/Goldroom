@@ -347,6 +347,11 @@ function prettyPin(pin) {
   return String(pin).replace(/(\d{4})(?=\d)/g, "$1 ").trim();
 }
 
+function pinFileName(denom, orderId) {
+  const id = String(orderId || "").replace(/[^\w-]+/g, "").slice(0, 24) || Date.now().toString(36);
+  return `Goldroom-USD${denom}-${id}.txt`;
+}
+
 function pinFile(denom, orderId, pin, serial) {
   const lines = [
     "Goldroom",
@@ -560,13 +565,17 @@ function pendingBuy(chatId) {
 }
 
 async function sendPinMessages(chatId, purchase, pin, serial) {
+  const code = String(pin || "").trim();
+  const serialCode = serial ? String(serial).trim() : "";
+  const orderId = String(purchase.id);
+  const denom = purchase.denom;
   const user = ensureUser(chatId, "");
   const body = [
     "Your PIN is below — keep this message.",
     "",
-    `Razer Gold US · $${purchase.denom}`,
-    `PIN: \`${prettyPin(pin)}\``,
-    serial ? `Serial: \`${serial}\`` : "",
+    `Razer Gold US · $${denom}`,
+    `PIN: \`${prettyPin(code)}\``,
+    serialCode ? `Serial: \`${serialCode}\`` : "",
     "",
     `Spent ${money(purchase.retailCents)} USDT. Balance: ${money(user.balanceCents)} USDT`,
     "",
@@ -577,7 +586,7 @@ async function sendPinMessages(chatId, purchase, pin, serial) {
   try {
     await bot.api.sendDocument(
       chatId,
-      new InputFile(pinFile(purchase.denom, purchase.id, pin, serial), `Goldroom-RazerGold-USD${purchase.denom}.txt`),
+      new InputFile(pinFile(denom, orderId, code, serialCode), pinFileName(denom, orderId)),
       { caption: "Download and keep this file. Screenshot the message above if you want a picture." },
     );
   } catch (fileErr) {
