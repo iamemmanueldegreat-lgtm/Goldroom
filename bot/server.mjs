@@ -504,6 +504,20 @@ async function notifyAdmin(text, extra = {}) {
   }
 }
 
+function statusLabel(st) {
+  return (
+    {
+      awaiting: "waiting",
+      checking: "confirming",
+      credited: "credited",
+      cancelled: "cancelled",
+      pending: "issuing",
+      delivered: "delivered",
+      failed: "failed",
+    }[st] || st
+  );
+}
+
 function parseDenomLabel(text) {
   const m = text.match(/^\$(\d+)/);
   if (!m) return null;
@@ -577,7 +591,7 @@ async function startDeposit(ctx, baseUsdt, method = "bep20") {
     return;
   }
   const user = ensureUser(ctx.chat.id, ctx.from?.username || String(ctx.from?.id));
-  await ctx.reply("Creating your deposit address…");
+  await ctx.reply("Preparing your deposit…");
   let pay;
   try {
     pay = await createPayment(amount, `dep-${ctx.chat.id}-${Date.now()}`, method);
@@ -695,8 +709,8 @@ async function sendPinMessages(chatId, purchase, pin, serial) {
     "Your PIN is below — keep this message.",
     "",
     `Razer Gold US · $${denom}`,
-    `PIN: \`${prettyPin(code)}\``,
-    serialCode ? `Serial: \`${serialCode}\`` : "",
+    `PIN: \`${prettyPin(code).replace(/`/g, "")}\``,
+    serialCode ? `Serial: \`${String(serialCode).replace(/`/g, "")}\`` : "",
     "",
     `Spent ${money(purchase.retailCents)} USDT. Balance: ${money(user.balanceCents)} USDT`,
     "",
@@ -788,7 +802,7 @@ async function watchPurchase(purchaseId) {
       if (bot) {
         await bot.api.sendMessage(
           stuck.chatId,
-          "Your order is still being issued. Keep this chat open — the PIN will arrive here. Do not pay again.",
+          "Your order is still being issued. Keep this chat open — the PIN will arrive here. Do not buy again.",
           { reply_markup: homeKb() },
         );
       }
@@ -1133,7 +1147,7 @@ if (bot) {
       ...mineDep.map((d) => `${d.id}  ·  ${d.payAmount} ${d.payAsset}  ·  ${d.status}`),
       "",
       mineBuy.length ? "Cards" : "No cards yet.",
-      ...mineBuy.map((p) => `${p.id}  ·  $${p.denom}  ·  ${p.status}`),
+      ...mineBuy.map((p) => `${p.id}  ·  $${p.denom}  ·  ${statusLabel(p.status)}`),
     ].join("\n");
     await ctx.reply(lines, { reply_markup: homeKb() });
   });
@@ -1286,7 +1300,7 @@ if (bot) {
     const sess = sessionOf(ctx.chat.id);
     const user = ensureUser(ctx.chat.id, ctx.from?.username || String(ctx.from?.id));
 
-    if (text === "Help" || text === "Support") {
+    if (/^(help|support)$/i.test(text)) {
       await openHelp(ctx);
       return;
     }
@@ -1308,7 +1322,7 @@ if (bot) {
       await handleSupportText(ctx, text);
       return;
     }
-    if (text === "Deposit") {
+    if (/^deposit$/i.test(text)) {
       sess.screen = "deposit";
       await ctx.reply(
         "Choose a deposit amount, or type one — for example 24.8 or 10.\n\nThen pick BEP20 or Aptos. Network fees are paid from your wallet. Your balance updates after confirmation.",
@@ -1316,7 +1330,7 @@ if (bot) {
       );
       return;
     }
-    if (text === "Buy Razer Gold" || text === "Amounts") {
+    if (/^(buy razer gold|buy|amounts)$/i.test(text)) {
       sess.screen = "catalog";
       const body =
         user.balanceCents <= 0
@@ -1325,27 +1339,13 @@ if (bot) {
       await ctx.reply(body, { reply_markup: catalogKb(user.balanceCents) });
       return;
     }
-    if (text === "Balance") {
+    if (/^balance$/i.test(text)) {
       await ctx.reply(`Goldroom balance: ${money(user.balanceCents)} USDT`, {
         reply_markup: homeKb(),
       });
       return;
     }
-    if (text === "Help") {
-      await ctx.reply(
-        "1. Deposit USDT on BEP20 or Aptos — send the exact amount shown.\n2. When your balance updates, tap Buy Razer Gold.\n3. Your PIN arrives in this chat.\n\nRedeem at gold.razer.com.",
-        { reply_markup: homeKb() },
-      );
-      return;
-    }
-    if (text === "Help") {
-      await ctx.reply(
-        "1. Deposit USDT on BEP20 or Aptos — send the exact amount shown.\n2. When your balance updates, tap Buy Razer Gold.\n3. Your PIN arrives in this chat.\n\nRedeem at gold.razer.com.",
-        { reply_markup: homeKb() },
-      );
-      return;
-    }
-    if (text === "Orders") {
+    if (/^orders$/i.test(text)) {
       const mineDep = [...desk.deposits.values()]
         .filter((d) => d.chatId === ctx.chat.id)
         .slice(-6)
@@ -1356,10 +1356,10 @@ if (bot) {
         .reverse();
       const lines = [
         mineDep.length ? "Deposits" : "No deposits.",
-        ...mineDep.map((d) => `${d.id}  ·  ${d.payAmount}  ·  ${d.status}`),
+        ...mineDep.map((d) => `${d.id}  ·  ${d.payAmount}  ·  ${statusLabel(d.status)}`),
         "",
         mineBuy.length ? "Cards" : "No cards yet.",
-        ...mineBuy.map((p) => `${p.id}  ·  $${p.denom}  ·  ${p.status}`),
+        ...mineBuy.map((p) => `${p.id}  ·  $${p.denom}  ·  ${statusLabel(p.status)}`),
       ].join("\n");
       await ctx.reply(lines, { reply_markup: homeKb() });
       return;
@@ -1373,6 +1373,11 @@ if (bot) {
         return;
       }
       await startDeposit(ctx, amt, net);
+      return;
+    }
+
+    if ((sess.screen === "catalog" || sess.screen === "confirm") && DENOMS.includes(Number(text))) {
+      await offerCard(ctx, Number(text));
       return;
     }
 
@@ -1437,8 +1442,18 @@ server.listen(PORT, "0.0.0.0", async () => {
   }
   if (!bot) return;
   bot.start({
-    onStart: (info) => {
+    onStart: async (info) => {
       console.log(`goldroom bot @${info.username} polling`);
+      try {
+        await bot.api.setMyCommands([
+          { command: "start", description: "Open Goldroom" },
+          { command: "help", description: "How to buy and get support" },
+          { command: "balance", description: "Your Goldroom balance" },
+          { command: "orders", description: "Your deposits and cards" },
+        ]);
+      } catch (err) {
+        console.warn("setMyCommands failed", err instanceof Error ? err.message : err);
+      }
       if (!WALLET_BEP20) console.warn("WALLET_USDT_BEP20 is not set");
       if (!ADMIN_ID) console.warn("ADMIN_TELEGRAM_ID is not set");
       if (!fazerConfigured()) console.warn("CARD_API_KEY is not set — buys cannot hit Fazer");
