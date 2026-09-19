@@ -55,6 +55,8 @@ const desk = {
   /** @type {Map<number, {screen: string, denom?: number, depositId?: string, depositAmount?: string}>} */
   sessions: new Map(),
   adminReplyTo: 0,
+  /** @type {Map<number, {open: boolean, live: boolean}>} */
+  tickets: new Map(),
 };
 
 function nid(prefix) {
@@ -265,7 +267,6 @@ function homeKb() {
     .text("Balance")
     .text("Orders")
     .row()
-    .text("Support")
     .text("Help")
     .resized();
 }
@@ -359,16 +360,22 @@ async function escalateSupport(ctx, text) {
     ].join("\n"),
     { reply_markup: kb },
   );
+  const ticket = desk.tickets.get(chatId);
+  if (ticket?.live || ticket?.open) {
+    await ctx.reply("Got it. We'll reply here.", { reply_markup: supportKb() });
+    return;
+  }
+  desk.tickets.set(chatId, { open: true, live: false });
   await ctx.reply(
     "A Goldroom specialist will be assigned to you shortly. Keep this chat open — we'll reply here.",
     { reply_markup: supportKb() },
   );
 }
 
-async function openSupport(ctx) {
+async function openHelp(ctx) {
   sessionOf(ctx.chat.id).screen = "support";
   await ctx.reply(
-    "Goldroom Support\n\nAsk a question, or pick a topic. For anything we can't settle here, a specialist is assigned to you.",
+    "Buy Razer Gold US in three steps.\n\n1. Deposit USDT on BEP20 or Aptos — send the exact amount shown.\n2. When your balance updates, tap Buy Razer Gold.\n3. Your PIN arrives in this chat.\n\nRedeem at gold.razer.com → Reload → Razer Gold PIN.\nCodes are final once revealed.\n\nNeed more help? Pick a topic or type a question.",
     { reply_markup: supportKb() },
   );
 }
@@ -912,9 +919,10 @@ if (bot) {
 
   bot.command("help", async (ctx) => {
     await ctx.reply(
-      "Buy Razer Gold US in three steps.\n\n1. Deposit USDT on BEP20 or Aptos — send the exact amount shown.\n2. When your balance updates, tap Buy Razer Gold.\n3. Your PIN arrives in this chat.\n\nRedeem at gold.razer.com → Reload → Razer Gold PIN.\nCodes are final once revealed.\n\nNeed help? Tap Support.",
-      { reply_markup: homeKb() },
+      "Buy Razer Gold US in three steps.\n\n1. Deposit USDT on BEP20 or Aptos — send the exact amount shown.\n2. When your balance updates, tap Buy Razer Gold.\n3. Your PIN arrives in this chat.\n\nRedeem at gold.razer.com → Reload → Razer Gold PIN.\nCodes are final once revealed.\n\nNeed more help? Pick a topic or type a question.",
+      { reply_markup: supportKb() },
     );
+    sessionOf(ctx.chat.id).screen = "support";
   });
 
   bot.command("done", async (ctx) => {
@@ -942,6 +950,10 @@ if (bot) {
     }
     try {
       await bot.api.sendMessage(chatId, msg, { reply_markup: supportKb() });
+      const t = desk.tickets.get(chatId) || { open: true, live: false };
+      t.open = true;
+      t.live = true;
+      desk.tickets.set(chatId, t);
       await ctx.reply("Sent.");
     } catch (err) {
       await ctx.reply(`Could not send: ${err instanceof Error ? err.message : err}`);
@@ -1158,6 +1170,7 @@ if (bot) {
     }
     const chatId = Number(ctx.match[1]);
     if (desk.adminReplyTo === chatId) desk.adminReplyTo = 0;
+    desk.tickets.delete(chatId);
     await ctx.answerCallbackQuery({ text: "Closed" });
     try {
       await bot.api.sendMessage(
@@ -1255,10 +1268,14 @@ if (bot) {
     const text = ctx.message.text.trim();
     if (text.startsWith("/")) return;
     await expireStale();
-    if (isAdmin(ctx) && desk.adminReplyTo && !["Deposit", "Buy Razer Gold", "Balance", "Orders", "Help", "Support", "Back", "Menu"].includes(text)) {
+    if (isAdmin(ctx) && desk.adminReplyTo && !["Deposit", "Buy Razer Gold", "Balance", "Orders", "Help", "Back", "Menu"].includes(text)) {
       const to = desk.adminReplyTo;
       try {
         await bot.api.sendMessage(to, text, { reply_markup: supportKb() });
+        const t = desk.tickets.get(to) || { open: true, live: false };
+        t.open = true;
+        t.live = true;
+        desk.tickets.set(to, t);
         await ctx.reply(`Sent to ${to}. Send another message, or /done to stop.`);
       } catch (err) {
         await ctx.reply(`Could not send: ${err instanceof Error ? err.message : err}`);
@@ -1268,8 +1285,17 @@ if (bot) {
     const sess = sessionOf(ctx.chat.id);
     const user = ensureUser(ctx.chat.id, ctx.from?.username || String(ctx.from?.id));
 
-    if (text === "Support") {
-      await openSupport(ctx);
+    if (text === "Help" || text === "Support") {
+      await openHelp(ctx);
+      return;
+    }
+    if (text === "Back" || text === "Menu") {
+      if (sess.screen === "network") {
+        sess.screen = "deposit";
+        await ctx.reply("Choose a deposit amount.", { reply_markup: depositKb() });
+        return;
+      }
+      await sendHome(ctx, "What do you need?");
       return;
     }
     if (text === "Deposit help" || text === "Buy a card" || text === "Redeem PIN" || text === "My order" || text === "Talk to a person") {
@@ -1311,6 +1337,13 @@ if (bot) {
       );
       return;
     }
+    if (text === "Help") {
+      await ctx.reply(
+        "1. Deposit USDT on BEP20 or Aptos — send the exact amount shown.\n2. When your balance updates, tap Buy Razer Gold.\n3. Your PIN arrives in this chat.\n\nRedeem at gold.razer.com.",
+        { reply_markup: homeKb() },
+      );
+      return;
+    }
     if (text === "Orders") {
       const mineDep = [...desk.deposits.values()]
         .filter((d) => d.chatId === ctx.chat.id)
@@ -1330,16 +1363,6 @@ if (bot) {
       await ctx.reply(lines, { reply_markup: homeKb() });
       return;
     }
-    if (text === "Back" || text === "Menu") {
-      if (sess.screen === "network") {
-        sess.screen = "deposit";
-        await ctx.reply("Choose a deposit amount.", { reply_markup: depositKb() });
-        return;
-      }
-      await sendHome(ctx, "What do you need?");
-      return;
-    }
-
     const net = parseNetwork(text);
     if (net) {
       const amt = sess.depositAmount;
