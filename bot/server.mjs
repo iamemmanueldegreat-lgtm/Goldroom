@@ -639,9 +639,9 @@ async function creditDeposit(depositId) {
   if (!d) return "Not found";
   if (d.status === "credited") return "Already credited";
   if (d.status !== "awaiting" && d.status !== "checking") return "Closed";
+  d.status = "credited";
   const user = ensureUser(d.chatId, d.username);
   user.balanceCents += d.creditCents;
-  d.status = "credited";
   d.creditedAt = Date.now();
   await save({ users: [user], deposits: [d] });
   if (bot) {
@@ -716,6 +716,7 @@ async function sendPinMessages(chatId, purchase, pin, serial) {
 }
 
 async function finishPurchase(purchase, pin, serial, costUsd, orderId) {
+  if (purchase.status === "delivered") return;
   purchase.status = "delivered";
   purchase.pin = pin;
   purchase.serial = serial;
@@ -1393,7 +1394,7 @@ if (bot) {
       return;
     }
 
-    await ctx.reply("Use the buttons below, or type deposit, buy, balance, support, or help.", {
+    await ctx.reply("Use the buttons below, or type deposit, buy, balance, or help.", {
       reply_markup: homeKb(),
     });
   });

@@ -58,13 +58,12 @@ function codesFrom(order) {
     for (const item of bag) {
       if (typeof item === "string") push(item);
       else if (item && typeof item === "object") {
-        push(item.pin || item.code || item.card || item.serial || item.value || item.number || item.pin_code);
+        push(item.pin || item.code || item.pin_code || item.card);
       }
     }
   }
   push(order.pin);
   push(order.code);
-  push(order.card);
   push(order.pin_code);
   push(order.payload?.pin);
   push(order.payload?.code);
@@ -88,7 +87,7 @@ export function matchOffer(offers, denom) {
     if (face === n) score += 10;
     const usd = Number(o.price_usd || o.price);
     if (usd && Math.abs(usd - n) < 0.05) score += 3;
-    if (String(o.card_id || "").includes(String(n))) score += 2;
+    if (new RegExp(`(?:^|[^A-Za-z0-9])${n}(?:[^A-Za-z0-9]|$)`).test(String(o.card_id || ""))) score += 2;
     return { o, score };
   });
   scored.sort((a, b) => b.score - a.score);
@@ -225,35 +224,43 @@ export async function buyRazerPin(denom, idem) {
   });
   let order = created.order || created;
   const orderId = order.id;
-  if (!codesFrom(order).length && orderId) {
-    order = await waitOrder(orderId);
-  }
-  const codes = codesFrom(order);
-  if (!codes.length) {
-    if (orderId) {
-      const err = new Error("PROCESSING");
-      err.code = "PROCESSING";
-      err.orderId = orderId;
-      err.charged = true;
+  try {
+    if (!codesFrom(order).length && orderId) {
+      order = await waitOrder(orderId);
+    }
+    const codes = codesFrom(order);
+    if (!codes.length) {
+      if (orderId) {
+        const err = new Error("PROCESSING");
+        err.code = "PROCESSING";
+        err.orderId = orderId;
+        err.charged = true;
+        throw err;
+      }
+      const err = new Error("NO_PIN");
+      err.code = "NO_OFFER";
       throw err;
     }
-    const err = new Error("NO_PIN");
-    err.code = "NO_OFFER";
+    const serial =
+      order.serial ||
+      order.payload?.serial ||
+      (typeof order.cards?.[0] === "object" ? order.cards[0].serial : "") ||
+      "";
+    return {
+      orderId: order.id || idem,
+      pin: codes[0],
+      serial: serial || String(order.id || ""),
+      costUsd: String(offer.price_usd || offer.price || ""),
+      offerName: offer.name || `$${denom}`,
+      categoryId: cat.categoryId,
+    };
+  } catch (err) {
+    if (orderId) {
+      err.orderId = err.orderId || orderId;
+      if (err.code !== "FAILED" && err.code !== "NO_OFFER") err.charged = true;
+    }
     throw err;
   }
-  const serial =
-    order.serial ||
-    order.payload?.serial ||
-    (typeof order.cards?.[0] === "object" ? order.cards[0].serial : "") ||
-    "";
-  return {
-    orderId: order.id || idem,
-    pin: codes[0],
-    serial: serial || String(order.id || ""),
-    costUsd: String(offer.price_usd || offer.price || ""),
-    offerName: offer.name || `$${denom}`,
-    categoryId: cat.categoryId,
-  };
 }
 
 export async function paymentMethods() {
