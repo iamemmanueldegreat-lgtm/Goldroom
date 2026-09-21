@@ -277,6 +277,38 @@ async function loadDesk() {
   }
 }
 
+
+async function zeroBalancesOnce() {
+  let done = false;
+  if (db) {
+    try {
+      const { data, error } = await db.from("goldroom_meta").select("value").eq("key", "balances_zeroed_v1");
+      if (error) throw error;
+      if (data && data.length) done = true;
+    } catch (err) {
+      console.error("balance reset flag read failed", err.message || err);
+    }
+  }
+  if (done) return;
+  for (const p of desk.purchases.values()) {
+    if (p.status === "pending") p.status = "failed";
+  }
+  for (const u of desk.users.values()) u.balanceCents = 0;
+  await save({
+    users: [...desk.users.values()],
+    purchases: [...desk.purchases.values()].filter((p) => p.status === "failed"),
+  });
+  if (db) {
+    const { error } = await db.from("goldroom_meta").upsert({ key: "balances_zeroed_v1", value: 1 });
+    if (error) {
+      console.error("balance reset flag write failed", error.message || error);
+      return;
+    }
+  }
+  console.log("all Goldroom balances reset to 0");
+  await notifyAdmin("All customer balances were reset to 0.00 USDT. They credit only after a confirmed deposit.");
+}
+
 function homeKb() {
   return new Keyboard()
     .text("Deposit")
@@ -668,7 +700,18 @@ async function creditDeposit(depositId) {
   const d = desk.deposits.get(depositId);
   if (!d) return "Not found";
   if (d.status === "credited") return "Already credited";
+  if (d.status === "cancelled") return "Closed";
   if (d.status !== "awaiting" && d.status !== "checking") return "Closed";
+  if (!fazerConfigured()) return "Closed";
+  try {
+    const pay = await getPayment(d.id);
+    if (!pay || !paidStatus(pay.status)) return d.status;
+    const credited = payLabel(pay.creditAmount) || payLabel(pay.sendAmount) || d.payAmount;
+    if (credited) d.creditCents = centsOf(credited);
+  } catch (err) {
+    console.error("credit verify failed", err instanceof Error ? err.message : err);
+    return d.status;
+  }
   d.status = "credited";
   const user = ensureUser(d.chatId, d.username);
   user.balanceCents += d.creditCents;
@@ -1486,6 +1529,7 @@ const server = http.createServer((req, res) => {
 server.listen(PORT, "0.0.0.0", async () => {
   console.log(`goldroom health listening on ${PORT}`);
   await loadDesk();
+  await zeroBalancesOnce();
   for (const d of desk.deposits.values()) {
     if (d.status === "awaiting" || d.status === "checking") void watchPayment(d.id);
   }
