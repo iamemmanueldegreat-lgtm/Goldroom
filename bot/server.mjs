@@ -58,6 +58,7 @@ const desk = {
   /** @type {Map<number, {open: boolean, live: boolean}>} */
   tickets: new Map(),
   depositCutoff: 0,
+  bootQuiet: true,
 };
 
 function nid(prefix) {
@@ -288,7 +289,7 @@ async function resetLedgerOnce() {
   let done = false;
   if (db) {
     try {
-      const { data, error } = await db.from("goldroom_meta").select("value").eq("key", "ledger_reset_v3");
+      const { data, error } = await db.from("goldroom_meta").select("value").eq("key", "ledger_reset_v4");
       if (error) throw error;
       if (data && data.length) done = true;
     } catch (err) {
@@ -311,7 +312,7 @@ async function resetLedgerOnce() {
   });
   if (db) {
     const { error } = await db.from("goldroom_meta").upsert([
-      { key: "ledger_reset_v3", value: 1 },
+      { key: "ledger_reset_v4", value: 1 },
       { key: "deposit_cutoff_s", value: Math.floor(desk.depositCutoff / 1000) },
     ]);
     if (error) {
@@ -321,7 +322,7 @@ async function resetLedgerOnce() {
   }
   console.log("ledger reset: balances 0, old deposits voided, cutoff", desk.depositCutoff);
   await notifyAdmin(
-    "Ledger reset. All balances are 0.00 USDT. Old invoices will not credit. New confirmed deposits will.",
+    "Ledger reset v4. All balances are 0.00 USDT. Customers were not messaged. Only new confirmed deposits will credit.",
   );
 }
 
@@ -628,7 +629,7 @@ async function tryConfirmFromFazer(depositId) {
       const was = d.status;
       d.status = "cancelled";
       await save({ deposits: [d] });
-      if (was !== "cancelled" && bot) {
+      if (was !== "cancelled" && bot && !desk.bootQuiet) {
         try {
           await bot.api.sendMessage(
             d.chatId,
@@ -755,7 +756,7 @@ async function creditDeposit(depositId) {
   user.balanceCents += d.creditCents;
   d.creditedAt = Date.now();
   await save({ users: [user], deposits: [d] });
-  if (bot) {
+  if (bot && !desk.bootQuiet) {
     await bot.api.sendMessage(
       d.chatId,
       `Deposit ${d.id} confirmed.\nBalance: ${money(user.balanceCents)} USDT\n\nYou can buy Razer Gold US now.`,
@@ -1565,7 +1566,9 @@ server.listen(PORT, "0.0.0.0", async () => {
   await loadDesk();
   await resetLedgerOnce();
   for (const d of desk.deposits.values()) {
-    if (d.status !== "credited" && !isLegacyDeposit(d)) void watchPayment(d.id);
+    if ((d.status === "awaiting" || d.status === "checking") && !isLegacyDeposit(d)) {
+      void watchPayment(d.id);
+    }
   }
   for (const p of desk.purchases.values()) {
     if (p.status === "pending") void watchPurchase(p.id);
@@ -1587,6 +1590,7 @@ server.listen(PORT, "0.0.0.0", async () => {
       if (!WALLET_BEP20) console.warn("WALLET_USDT_BEP20 is not set");
       if (!ADMIN_ID) console.warn("ADMIN_TELEGRAM_ID is not set");
       if (!fazerConfigured()) console.warn("CARD_API_KEY is not set — buys cannot hit Fazer");
+      desk.bootQuiet = false;
     },
   });
 });
