@@ -262,7 +262,7 @@ async function loadDesk() {
     desk.prices = { ...DEFAULT_PRICES };
     for (const r of meta.data || []) {
       if (r.key === "seq") desk.seq = Number(r.value) || 1;
-      if (r.key === "deposit_cutoff_ms") desk.depositCutoff = Number(r.value) || 0;
+      if (r.key === "deposit_cutoff_s") desk.depositCutoff = (Number(r.value) || 0) * 1000;
       if (String(r.key).startsWith("price_")) {
         const d = Number(String(r.key).slice(6));
         if (DENOMS.includes(d) && Number(r.value) > 0) desk.prices[d] = Number(r.value) / 100;
@@ -312,7 +312,7 @@ async function resetLedgerOnce() {
   if (db) {
     const { error } = await db.from("goldroom_meta").upsert([
       { key: "ledger_reset_v3", value: 1 },
-      { key: "deposit_cutoff_ms", value: desk.depositCutoff },
+      { key: "deposit_cutoff_s", value: Math.floor(desk.depositCutoff / 1000) },
     ]);
     if (error) {
       console.error("ledger reset flag write failed", error.message || error);
