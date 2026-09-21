@@ -11,6 +11,8 @@ import {
   getPayment,
   getOrder,
   extractCodes,
+  listRecentOrders,
+  waitFazerOrder,
 } from "./fazer.mjs";
 
 const TOKEN = (process.env.TELEGRAM_BOT_TOKEN || "").trim();
@@ -1129,6 +1131,8 @@ if (bot) {
         "/credit 123456789 25 — add USDT",
         "/unlock 123456789 — clear a stuck card (no refund)",
         "/catalog — supplier offers",
+        "/fz — latest supplier orders",
+        "/fz ord-123 — pull that order / PIN",
       ].join("\n"),
     );
   });
@@ -1264,6 +1268,67 @@ if (bot) {
       );
     } catch {
       /* ignore */
+    }
+  });
+
+  bot.command("fz", async (ctx) => {
+    if (!isAdmin(ctx)) {
+      await ctx.reply("Not for buyers.");
+      return;
+    }
+    if (!fazerConfigured()) {
+      await ctx.reply("Supplier API is not set.");
+      return;
+    }
+    const arg = (ctx.match || ctx.message?.text || "").replace(/^\/fz(@\w+)?/i, "").trim();
+    const orderId = (arg.match(/ord-[\w-]+/i) || [])[0];
+    try {
+      if (orderId) {
+        await ctx.reply(`Checking ${orderId}…`);
+        let order = await getOrder(orderId);
+        const st = String(order?.status || "").toLowerCase();
+        if ((st === "processing" || st === "created") && !extractCodes(order).length) {
+          try {
+            order = await waitFazerOrder(orderId, 45_000);
+          } catch {
+            order = await getOrder(orderId).catch(() => order);
+          }
+        }
+        const codes = extractCodes(order);
+        const lines = [
+          order.id || orderId,
+          `Status: ${order.status || "?"}`,
+          order.title || order.offer_name || order.kind || "",
+          codes.length ? `PIN ready (${codes.length})` : "No PIN yet",
+        ].filter(Boolean);
+        await ctx.reply(lines.join("\n"));
+        if (codes[0]) {
+          const serial =
+            order.serial ||
+            (typeof order.cards?.[0] === "object" ? order.cards[0].serial : "") ||
+            "";
+          await ctx.replyWithDocument(
+            new InputFile(
+              pinFile(0, order.id || orderId, codes[0], serial),
+              pinFileName(0, order.id || orderId),
+            ),
+            { caption: `${order.id} · ${order.status}` },
+          );
+        }
+        return;
+      }
+      const items = await listRecentOrders(15);
+      if (!items.length) {
+        await ctx.reply("No supplier orders returned.");
+        return;
+      }
+      const lines = items.map((o) => {
+        const pin = extractCodes(o).length ? "PIN" : "no PIN";
+        return `${o.id} · ${o.status} · ${pin} · ${o.title || o.offer_name || o.kind || ""}`;
+      });
+      await ctx.reply(["Latest supplier orders", "", ...lines].join("\n"));
+    } catch (err) {
+      await ctx.reply(err instanceof Error ? err.message : String(err));
     }
   });
 

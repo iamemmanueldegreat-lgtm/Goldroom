@@ -143,6 +143,15 @@ export async function getOrder(id) {
   return client.orders.get(id);
 }
 
+export async function listRecentOrders(limit = 15) {
+  const page = await client.orders.list({ page: 1, limit });
+  return page.items || [];
+}
+
+export async function waitFazerOrder(id, timeoutMs = 45_000) {
+  return client.orders.wait(id, { timeoutMs, intervalMs: 5_000 });
+}
+
 function failedStatus(st) {
   return ["failed", "fail", "refund", "refunded", "cancelled", "canceled", "error"].includes(String(st || "").toLowerCase());
 }
