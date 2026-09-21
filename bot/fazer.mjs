@@ -190,11 +190,6 @@ export async function buyRazerPin(denom, idem) {
     err.code = "NO_OFFER";
     throw err;
   }
-  if (offer.stock === 0) {
-    const err = new Error("OUT_OF_STOCK");
-    err.code = "NO_OFFER";
-    throw err;
-  }
   let order;
   try {
     order = await client.giftcards.order({
@@ -220,7 +215,7 @@ export async function buyRazerPin(denom, idem) {
     }
     if (!codesFrom(order).length && orderId) {
       try {
-        order = await client.orders.wait(orderId, { timeoutMs: 40_000, intervalMs: 5_000 });
+        order = await client.orders.wait(orderId, { timeoutMs: 60_000, intervalMs: 5_000 });
       } catch (err) {
         if (err instanceof FazerCardsTimeoutError) {
           const latest = await client.orders.get(orderId).catch(() => order);
