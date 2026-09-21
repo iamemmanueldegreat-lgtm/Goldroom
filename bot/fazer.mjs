@@ -16,19 +16,30 @@ async function fzr(path, { method = "GET", body, idem } = {}) {
   };
   if (body) headers["Content-Type"] = "application/json";
   if (idem) headers["Idempotency-Key"] = String(idem).slice(0, 255);
-  const res = await fetch(`${BASE}${path}`, {
-    method,
-    headers,
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  const json = await res.json().catch(() => ({}));
-  if (!res.ok || json.ok === false) {
-    const err = new Error(json.error || json.message || `fazer HTTP ${res.status}`);
-    err.status = res.status;
-    err.code = json.code;
-    throw err;
+  let lastErr;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const res = await fetch(`${BASE}${path}`, {
+      method,
+      headers,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    if (res.status === 429) {
+      const wait = Math.min(30_000, (Number(res.headers.get("retry-after")) || 2) * 1000);
+      await new Promise((r) => setTimeout(r, wait + Math.floor(Math.random() * 400)));
+      lastErr = new Error("fazer HTTP 429");
+      lastErr.status = 429;
+      continue;
+    }
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok || json.ok === false) {
+      const err = new Error(json.error || json.message || `fazer HTTP ${res.status}`);
+      err.status = res.status;
+      err.code = json.code;
+      throw err;
+    }
+    return json;
   }
-  return json;
+  throw lastErr || new Error("fazer HTTP 429");
 }
 
 function codesFrom(order) {
@@ -137,8 +148,8 @@ function pickCategory(hits) {
 
 export async function razerCatalog(force = false) {
   const now = Date.now();
-  if (!force && now - cache.at < 45_000 && cache.offers.length && cache.categoryId) return cache;
-  const hits = await listGiftcardHits();
+  if (!force && now - cache.at < 10 * 60 * 1000 && cache.offers.length && cache.categoryId) return cache;
+  const hits = FORCED_CATEGORY ? [] : await listGiftcardHits();
   const categoryId = pickCategory(hits);
   if (!categoryId) {
     cache = { at: now, categoryId: "", offers: [], hits };
@@ -155,13 +166,8 @@ export async function razerCatalog(force = false) {
 }
 
 export async function getOrder(id) {
-  try {
-    const data = await fzr(`/orders/${encodeURIComponent(id)}`);
-    return data.order || data;
-  } catch {
-    const data = await fzr(`/giftcards/order/${encodeURIComponent(id)}`);
-    return data.order || data;
-  }
+  const data = await fzr(`/orders/${encodeURIComponent(id)}`);
+  return data.order || data;
 }
 
 function failedStatus(st) {
@@ -181,7 +187,7 @@ async function waitOrder(id, ms = 180_000) {
       err.orderId = id;
       throw err;
     }
-    await new Promise((r) => setTimeout(r, 3000));
+    await new Promise((r) => setTimeout(r, 5000));
   }
   if (last && codesFrom(last).length) return last;
   const err = new Error("PROCESSING");

@@ -913,7 +913,7 @@ async function watchPurchase(purchaseId) {
           );
         }
       }
-      await new Promise((r) => setTimeout(r, age > 12 * 60 * 1000 ? 20000 : 4000));
+      await new Promise((r) => setTimeout(r, age > 12 * 60 * 1000 ? 30000 : 8000));
     }
   } finally {
     watchingBuys.delete(purchaseId);
