@@ -75,6 +75,24 @@ function exactUsdt(n) {
   return (cents / 100).toFixed(2);
 }
 
+function payLabel(n) {
+  const raw = String(n ?? "").trim();
+  if (!raw) return null;
+  const x = Number(raw);
+  if (!Number.isFinite(x) || x <= 0) return null;
+  if (/\.\d{3,}/.test(raw)) {
+    return raw.replace(/(\.\d*?[1-9])0+$/, "$1").replace(/\.$/, "");
+  }
+  return exactUsdt(x);
+}
+
+function recentFor(chatId, map, n = 6) {
+  return [...map.values()]
+    .filter((row) => row.chatId === chatId)
+    .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
+    .slice(0, n);
+}
+
 function money(cents) {
   return (cents / 100).toFixed(2);
 }
@@ -328,6 +346,7 @@ function supportFaq(text, chatId) {
   if (/txt|file|download/.test(t)) {
     return "Each PIN is sent as a chat message and a .txt file. The code in both should match. The file name includes your order id so later cards don't overwrite earlier ones.";
   }
+  if (/(balance).*(not|no|wrong|missing|didn't|didnt|still|waiting|delay|update)/.test(t)) return null;
   if (/balance/.test(t)) {
     const user = desk.users.get(chatId);
     return `Your Goldroom balance is ${money(user?.balanceCents || 0)} USDT.`;
@@ -453,15 +472,7 @@ function isAdmin(ctx) {
 }
 
 async function expireStale() {
-  const now = Date.now();
-  const dirty = [];
-  for (const d of desk.deposits.values()) {
-    if (d.status === "awaiting" && d.expiresAt < now) {
-      d.status = "cancelled";
-      dirty.push(d);
-    }
-  }
-  if (dirty.length) await save({ deposits: dirty });
+  /* Keep invoices open until the payment is confirmed or the supplier expires them. */
 }
 
 function prettyPin(pin) {
@@ -568,12 +579,13 @@ async function watchPayment(depositId) {
   if (watching.has(depositId)) return;
   watching.add(depositId);
   try {
-    const first = desk.deposits.get(depositId);
-    const until = (first?.expiresAt || Date.now()) + 10 * 60 * 1000;
-    while (Date.now() < until) {
+    while (true) {
+      const d = desk.deposits.get(depositId);
+      if (!d || d.status === "credited" || d.status === "cancelled") return;
       const st = await tryConfirmFromFazer(depositId);
       if (["Credited", "Already credited", "Closed", "cancelled", "Not found"].includes(st)) return;
-      await new Promise((r) => setTimeout(r, 8000));
+      const slow = d.expiresAt && Date.now() > d.expiresAt + 10 * 60 * 1000;
+      await new Promise((r) => setTimeout(r, slow ? 30000 : 8000));
     }
   } finally {
     watching.delete(depositId);
@@ -609,8 +621,8 @@ async function startDeposit(ctx, baseUsdt, method = "bep20") {
     await notifyAdmin(`Deposit create failed for @${user.username}: ${err instanceof Error ? err.message : err}`);
     return;
   }
-  const send = exactUsdt(pay.sendAmount) || amount;
-  const credit = exactUsdt(pay.creditAmount) || amount;
+  const send = payLabel(pay.sendAmount) || amount;
+  const credit = payLabel(pay.creditAmount) || amount;
   const exp = pay.expiresAt ? new Date(pay.expiresAt).getTime() : Date.now() + ORDER_TTL_MS;
   const deposit = {
     id: pay.id,
@@ -644,7 +656,11 @@ async function startDeposit(ctx, baseUsdt, method = "bep20") {
     lines.push("", `Memo: \`${pay.memo}\``);
   }
   lines.push("", "Send this amount. Network fees on your wallet are paid by you.", "Your balance updates automatically after confirmation.");
-  await ctx.reply(lines.join("\n"), { parse_mode: "Markdown", reply_markup: kb });
+  try {
+    await ctx.reply(lines.join("\n"), { parse_mode: "Markdown", reply_markup: kb });
+  } catch {
+    await ctx.reply(lines.join("\n").replace(/`/g, ""), { reply_markup: kb });
+  }
   void watchPayment(deposit.id);
 }
 
@@ -717,7 +733,12 @@ async function sendPinMessages(chatId, purchase, pin, serial) {
     "Redeem at gold.razer.com → Reload → Razer Gold PIN.",
   ].filter((l, i, a) => !(l === "" && a[i - 1] === "")).join("\n");
   if (!bot) return;
-  await bot.api.sendMessage(chatId, body, { parse_mode: "Markdown", reply_markup: homeKb() });
+  try {
+    await bot.api.sendMessage(chatId, body, { parse_mode: "Markdown", reply_markup: homeKb() });
+  } catch {
+    const plain = body.replace(/`/g, "");
+    await bot.api.sendMessage(chatId, plain, { reply_markup: homeKb() });
+  }
   try {
     await bot.api.sendDocument(
       chatId,
@@ -746,9 +767,9 @@ async function finishPurchase(purchase, pin, serial, costUsd, orderId) {
 
 async function refundPurchase(purchase, reason) {
   if (purchase.status === "failed" || purchase.status === "delivered") return;
+  purchase.status = "failed";
   const user = ensureUser(purchase.chatId, "");
   user.balanceCents += purchase.retailCents;
-  purchase.status = "failed";
   await save({ users: [user], purchases: [purchase] });
   if (bot) {
     await bot.api.sendMessage(
@@ -763,12 +784,17 @@ async function refundPurchase(purchase, reason) {
 async function watchPurchase(purchaseId) {
   if (watchingBuys.has(purchaseId)) return;
   watchingBuys.add(purchaseId);
+  let told = false;
   try {
-    const until = Date.now() + 12 * 60 * 1000;
-    while (Date.now() < until) {
+    while (true) {
       const purchase = desk.purchases.get(purchaseId);
       if (!purchase || purchase.status !== "pending") return;
+      const age = Date.now() - (purchase.createdAt || Date.now());
       if (!purchase.fazerOrderId) {
+        if (age > 3 * 60 * 1000) {
+          await refundPurchase(purchase, "no supplier order");
+          return;
+        }
         await new Promise((r) => setTimeout(r, 4000));
         continue;
       }
@@ -792,20 +818,20 @@ async function watchPurchase(purchaseId) {
       } catch (err) {
         console.error("watch purchase", err instanceof Error ? err.message : err);
       }
-      await new Promise((r) => setTimeout(r, 4000));
-    }
-    const stuck = desk.purchases.get(purchaseId);
-    if (stuck && stuck.status === "pending") {
-      await notifyAdmin(
-        `PIN still processing ${stuck.id} $${stuck.denom} chat ${stuck.chatId}\nFazer ${stuck.fazerOrderId || "?"}\nDo not refund unless Fazer failed.`,
-      );
-      if (bot) {
-        await bot.api.sendMessage(
-          stuck.chatId,
-          "Your order is still being issued. Keep this chat open — the PIN will arrive here. Do not buy again.",
-          { reply_markup: homeKb() },
+      if (age > 12 * 60 * 1000 && !told) {
+        told = true;
+        await notifyAdmin(
+          `PIN still processing ${purchase.id} $${purchase.denom} chat ${purchase.chatId}\nFazer ${purchase.fazerOrderId || "?"}\nStill polling. /unlock ${purchase.chatId} if they already have the PIN.`,
         );
+        if (bot) {
+          await bot.api.sendMessage(
+            purchase.chatId,
+            "Your order is still being issued. Keep this chat open — the PIN will arrive here. Do not buy again.",
+            { reply_markup: homeKb() },
+          );
+        }
       }
+      await new Promise((r) => setTimeout(r, age > 12 * 60 * 1000 ? 20000 : 4000));
     }
   } finally {
     watchingBuys.delete(purchaseId);
@@ -1025,6 +1051,7 @@ if (bot) {
         "/price 25 29.50 — set sell price",
         "/users — customer balances",
         "/credit 123456789 25 — add USDT",
+        "/unlock 123456789 — clear a stuck card (no refund)",
         "/catalog — supplier offers",
       ].join("\n"),
     );
@@ -1133,18 +1160,49 @@ if (bot) {
     }
   });
 
+
+  bot.command("unlock", async (ctx) => {
+    if (!isAdmin(ctx)) {
+      await ctx.reply("Not for buyers.");
+      return;
+    }
+    const chatId = Number((ctx.match || "").trim().split(/\s+/)[0]);
+    if (!chatId) {
+      await ctx.reply("Usage: /unlock 123456789");
+      return;
+    }
+    const open = pendingBuy(chatId);
+    if (!open) {
+      await ctx.reply("No stuck card for that id.");
+      return;
+    }
+    open.status = "failed";
+    await save({ purchases: [open] });
+    buying.delete(chatId);
+    await ctx.reply(`Unlocked ${open.id} for ${chatId}. Balance was not changed.`);
+    try {
+      await bot.api.sendMessage(
+        chatId,
+        "You can buy again now.",
+        { reply_markup: homeKb() },
+      );
+    } catch {
+      /* ignore */
+    }
+  });
+
   bot.command("orders", async (ctx) => {
     const mineDep = [...desk.deposits.values()]
       .filter((d) => (isAdmin(ctx) ? true : d.chatId === ctx.chat.id))
-      .slice(-6)
-      .reverse();
+      .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
+      .slice(0, 6);
     const mineBuy = [...desk.purchases.values()]
       .filter((p) => (isAdmin(ctx) ? true : p.chatId === ctx.chat.id))
-      .slice(-6)
-      .reverse();
+      .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
+      .slice(0, 6);
     const lines = [
       mineDep.length ? "Deposits" : "No deposits.",
-      ...mineDep.map((d) => `${d.id}  ·  ${d.payAmount} ${d.payAsset}  ·  ${d.status}`),
+      ...mineDep.map((d) => `${d.id}  ·  ${d.payAmount} ${d.payAsset}  ·  ${statusLabel(d.status)}`),
       "",
       mineBuy.length ? "Cards" : "No cards yet.",
       ...mineBuy.map((p) => `${p.id}  ·  $${p.denom}  ·  ${statusLabel(p.status)}`),
@@ -1190,7 +1248,7 @@ if (bot) {
     try {
       await bot.api.sendMessage(
         chatId,
-        "Your support ticket is closed. Tap Support anytime if you need us again.",
+        "Your support ticket is closed. Tap Help anytime if you need us again.",
         { reply_markup: homeKb() },
       );
     } catch {
@@ -1268,8 +1326,8 @@ if (bot) {
       await ctx.answerCallbackQuery({ text: "Not found" });
       return;
     }
-    if (d.status !== "awaiting" && d.status !== "checking") {
-      await ctx.answerCallbackQuery({ text: "Already closed" });
+    if (d.status !== "awaiting") {
+      await ctx.answerCallbackQuery({ text: "Already moving" });
       return;
     }
     d.status = "cancelled";
@@ -1346,14 +1404,8 @@ if (bot) {
       return;
     }
     if (/^orders$/i.test(text)) {
-      const mineDep = [...desk.deposits.values()]
-        .filter((d) => d.chatId === ctx.chat.id)
-        .slice(-6)
-        .reverse();
-      const mineBuy = [...desk.purchases.values()]
-        .filter((p) => p.chatId === ctx.chat.id)
-        .slice(-6)
-        .reverse();
+      const mineDep = recentFor(ctx.chat.id, desk.deposits);
+      const mineBuy = recentFor(ctx.chat.id, desk.purchases);
       const lines = [
         mineDep.length ? "Deposits" : "No deposits.",
         ...mineDep.map((d) => `${d.id}  ·  ${d.payAmount}  ·  ${statusLabel(d.status)}`),
