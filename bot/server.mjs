@@ -789,7 +789,8 @@ async function offerCard(ctx, denom) {
 }
 
 const buying = new Set();
-const watchingBuys = new Set();
+let tickingBuys = false;
+const buyTold = new Set();
 
 function pendingBuy(chatId) {
   return [...desk.purchases.values()].find(
@@ -863,21 +864,24 @@ async function refundPurchase(purchase, reason) {
   await notifyAdmin(`Buy refunded ${purchase.id} @${user.username} $${purchase.denom}\n${reason}`);
 }
 
-async function watchPurchase(purchaseId) {
-  if (watchingBuys.has(purchaseId)) return;
-  watchingBuys.add(purchaseId);
-  let told = false;
+async function tickPendingBuys() {
+  if (tickingBuys) return;
+  tickingBuys = true;
   try {
-    while (true) {
-      const purchase = desk.purchases.get(purchaseId);
-      if (!purchase || purchase.status !== "pending") return;
+    const pending = [...desk.purchases.values()].filter((p) => p.status === "pending");
+    for (const purchase of pending) {
       const age = Date.now() - (purchase.createdAt || Date.now());
       if (!purchase.fazerOrderId) {
-        if (age > 3 * 60 * 1000) {
-          await refundPurchase(purchase, "no supplier order");
-          return;
+        if (age > 3 * 60 * 1000) await refundPurchase(purchase, "no supplier order");
+        continue;
+      }
+      if (age > 45 * 60 * 1000) {
+        if (!buyTold.has(purchase.id)) {
+          buyTold.add(purchase.id);
+          await notifyAdmin(
+            `Stopped polling ${purchase.id} $${purchase.denom} chat ${purchase.chatId}\nFazer ${purchase.fazerOrderId}\n/unlock ${purchase.chatId}`,
+          );
         }
-        await new Promise((r) => setTimeout(r, 4000));
         continue;
       }
       try {
@@ -887,37 +891,27 @@ async function watchPurchase(purchaseId) {
         if (codes.length) {
           const serial =
             order.serial ||
-            order.payload?.serial ||
             (typeof order.cards?.[0] === "object" ? order.cards[0].serial : "") ||
             purchase.fazerOrderId;
           await finishPurchase(purchase, codes[0], serial, purchase.costUsd, purchase.fazerOrderId);
-          return;
+          continue;
         }
         if (["failed", "fail", "refund", "refunded", "cancelled", "canceled", "error"].includes(st)) {
           await refundPurchase(purchase, `supplier ${st}`);
-          return;
         }
       } catch (err) {
         console.error("watch purchase", err instanceof Error ? err.message : err);
       }
-      if (age > 12 * 60 * 1000 && !told) {
-        told = true;
-        await notifyAdmin(
-          `PIN still processing ${purchase.id} $${purchase.denom} chat ${purchase.chatId}\nFazer ${purchase.fazerOrderId || "?"}\nStill polling. /unlock ${purchase.chatId} if they already have the PIN.`,
-        );
-        if (bot) {
-          await bot.api.sendMessage(
-            purchase.chatId,
-            "Your order is still being issued. Keep this chat open — the PIN will arrive here. Do not buy again.",
-            { reply_markup: homeKb() },
-          );
-        }
-      }
-      await new Promise((r) => setTimeout(r, age > 12 * 60 * 1000 ? 30000 : 8000));
+      await new Promise((r) => setTimeout(r, 1500));
     }
   } finally {
-    watchingBuys.delete(purchaseId);
+    tickingBuys = false;
   }
+}
+
+function watchPurchase(purchaseId) {
+  void purchaseId;
+  void tickPendingBuys();
 }
 
 async function buyCard(ctx, denom) {
@@ -1570,9 +1564,8 @@ server.listen(PORT, "0.0.0.0", async () => {
       void watchPayment(d.id);
     }
   }
-  for (const p of desk.purchases.values()) {
-    if (p.status === "pending") void watchPurchase(p.id);
-  }
+  void tickPendingBuys();
+  setInterval(() => void tickPendingBuys(), 20_000);
   if (!bot) return;
   bot.start({
     onStart: async (info) => {
