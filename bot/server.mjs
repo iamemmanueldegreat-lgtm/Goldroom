@@ -282,7 +282,7 @@ async function zeroBalancesOnce() {
   let done = false;
   if (db) {
     try {
-      const { data, error } = await db.from("goldroom_meta").select("value").eq("key", "balances_zeroed_v1");
+      const { data, error } = await db.from("goldroom_meta").select("value").eq("key", "balances_zeroed_v2");
       if (error) throw error;
       if (data && data.length) done = true;
     } catch (err) {
@@ -299,14 +299,14 @@ async function zeroBalancesOnce() {
     purchases: [...desk.purchases.values()].filter((p) => p.status === "failed"),
   });
   if (db) {
-    const { error } = await db.from("goldroom_meta").upsert({ key: "balances_zeroed_v1", value: 1 });
+    const { error } = await db.from("goldroom_meta").upsert({ key: "balances_zeroed_v2", value: 1 });
     if (error) {
       console.error("balance reset flag write failed", error.message || error);
       return;
     }
   }
   console.log("all Goldroom balances reset to 0");
-  await notifyAdmin("All customer balances were reset to 0.00 USDT. They credit only after a confirmed deposit.");
+  await notifyAdmin("All customer balances were reset to 0.00 USDT again. They credit only after a confirmed deposit.");
 }
 
 function homeKb() {
