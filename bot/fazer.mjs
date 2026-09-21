@@ -65,6 +65,10 @@ function codesFrom(order) {
     if (typeof v === "string" && v.trim()) out.push(v.trim());
   };
   for (const bag of bags) {
+    if (typeof bag === "string") {
+      push(bag);
+      continue;
+    }
     if (!Array.isArray(bag)) continue;
     for (const item of bag) {
       if (typeof item === "string") push(item);
@@ -165,9 +169,31 @@ export async function razerCatalog(force = false) {
   return cache;
 }
 
+function unwrapOrder(data) {
+  if (!data || typeof data !== "object") return data;
+  return data.order || data.data?.order || data;
+}
+
 export async function getOrder(id) {
-  const data = await fzr(`/orders/${encodeURIComponent(id)}`);
-  return data.order || data;
+  const paths = [`/orders/${encodeURIComponent(id)}`, `/order/${encodeURIComponent(id)}`];
+  let lastErr;
+  for (const path of paths) {
+    try {
+      return unwrapOrder(await fzr(path));
+    } catch (err) {
+      lastErr = err;
+      if (err.status === 429) throw err;
+    }
+  }
+  try {
+    const data = await fzr("/orders?page=1&limit=25");
+    const items = data.items || data.orders || [];
+    const hit = items.find((o) => String(o.id) === String(id));
+    if (hit) return unwrapOrder(hit);
+  } catch (err) {
+    lastErr = lastErr || err;
+  }
+  throw lastErr || new Error("order not found");
 }
 
 function failedStatus(st) {
@@ -178,16 +204,20 @@ async function waitOrder(id, ms = 180_000) {
   const start = Date.now();
   let last = null;
   while (Date.now() - start < ms) {
-    last = await getOrder(id);
-    if (codesFrom(last).length) return last;
-    const st = String(last?.status || "").toLowerCase();
-    if (failedStatus(st)) {
-      const err = new Error(`ORDER_FAILED:${st}`);
-      err.code = "FAILED";
-      err.orderId = id;
-      throw err;
+    try {
+      last = await getOrder(id);
+      if (codesFrom(last).length) return last;
+      const st = String(last?.status || "").toLowerCase();
+      if (failedStatus(st)) {
+        const err = new Error(`ORDER_FAILED:${st}`);
+        err.code = "FAILED";
+        err.orderId = id;
+        throw err;
+      }
+    } catch (err) {
+      if (err.code === "FAILED") throw err;
     }
-    await new Promise((r) => setTimeout(r, 5000));
+    await new Promise((r) => setTimeout(r, 4000));
   }
   if (last && codesFrom(last).length) return last;
   const err = new Error("PROCESSING");
