@@ -57,6 +57,7 @@ const desk = {
   adminReplyTo: 0,
   /** @type {Map<number, {open: boolean, live: boolean}>} */
   tickets: new Map(),
+  depositCutoff: 0,
 };
 
 function nid(prefix) {
@@ -261,6 +262,7 @@ async function loadDesk() {
     desk.prices = { ...DEFAULT_PRICES };
     for (const r of meta.data || []) {
       if (r.key === "seq") desk.seq = Number(r.value) || 1;
+      if (r.key === "deposit_cutoff_ms") desk.depositCutoff = Number(r.value) || 0;
       if (String(r.key).startsWith("price_")) {
         const d = Number(String(r.key).slice(6));
         if (DENOMS.includes(d) && Number(r.value) > 0) desk.prices[d] = Number(r.value) / 100;
@@ -278,35 +280,49 @@ async function loadDesk() {
 }
 
 
-async function zeroBalancesOnce() {
+function isLegacyDeposit(d) {
+  return desk.depositCutoff > 0 && (d.createdAt || 0) < desk.depositCutoff;
+}
+
+async function resetLedgerOnce() {
   let done = false;
   if (db) {
     try {
-      const { data, error } = await db.from("goldroom_meta").select("value").eq("key", "balances_zeroed_v2");
+      const { data, error } = await db.from("goldroom_meta").select("value").eq("key", "ledger_reset_v3");
       if (error) throw error;
       if (data && data.length) done = true;
     } catch (err) {
-      console.error("balance reset flag read failed", err.message || err);
+      console.error("ledger reset flag read failed", err.message || err);
     }
   }
   if (done) return;
+  desk.depositCutoff = Date.now();
   for (const p of desk.purchases.values()) {
     if (p.status === "pending") p.status = "failed";
   }
   for (const u of desk.users.values()) u.balanceCents = 0;
+  for (const d of desk.deposits.values()) {
+    if (d.status !== "cancelled") d.status = "cancelled";
+  }
   await save({
     users: [...desk.users.values()],
     purchases: [...desk.purchases.values()].filter((p) => p.status === "failed"),
+    deposits: [...desk.deposits.values()],
   });
   if (db) {
-    const { error } = await db.from("goldroom_meta").upsert({ key: "balances_zeroed_v2", value: 1 });
+    const { error } = await db.from("goldroom_meta").upsert([
+      { key: "ledger_reset_v3", value: 1 },
+      { key: "deposit_cutoff_ms", value: desk.depositCutoff },
+    ]);
     if (error) {
-      console.error("balance reset flag write failed", error.message || error);
+      console.error("ledger reset flag write failed", error.message || error);
       return;
     }
   }
-  console.log("all Goldroom balances reset to 0");
-  await notifyAdmin("All customer balances were reset to 0.00 USDT again. They credit only after a confirmed deposit.");
+  console.log("ledger reset: balances 0, old deposits voided, cutoff", desk.depositCutoff);
+  await notifyAdmin(
+    "Ledger reset. All balances are 0.00 USDT. Old invoices will not credit. New confirmed deposits will.",
+  );
 }
 
 function homeKb() {
@@ -597,6 +613,7 @@ async function tryConfirmFromFazer(depositId) {
   const d = desk.deposits.get(depositId);
   if (!d) return "Not found";
   if (d.status === "credited") return "Already credited";
+  if (isLegacyDeposit(d)) return "Closed";
   if (!fazerConfigured()) return d.status;
   try {
     const pay = await getPayment(d.id);
@@ -636,7 +653,7 @@ async function watchPayment(depositId) {
   try {
     while (true) {
       const d = desk.deposits.get(depositId);
-      if (!d || d.status === "credited") return;
+      if (!d || d.status === "credited" || isLegacyDeposit(d)) return;
       const st = await tryConfirmFromFazer(depositId);
       if (["Credited", "Already credited", "Not found"].includes(st)) return;
       if (st === "cancelled") return;
@@ -722,6 +739,7 @@ async function creditDeposit(depositId) {
   const d = desk.deposits.get(depositId);
   if (!d) return "Not found";
   if (d.status === "credited") return "Already credited";
+  if (isLegacyDeposit(d)) return "Closed";
   if (!fazerConfigured()) return d.status;
   try {
     const pay = await getPayment(d.id);
@@ -1545,9 +1563,9 @@ const server = http.createServer((req, res) => {
 server.listen(PORT, "0.0.0.0", async () => {
   console.log(`goldroom health listening on ${PORT}`);
   await loadDesk();
-  await zeroBalancesOnce();
+  await resetLedgerOnce();
   for (const d of desk.deposits.values()) {
-    if (d.status !== "credited") void watchPayment(d.id);
+    if (d.status !== "credited" && !isLegacyDeposit(d)) void watchPayment(d.id);
   }
   for (const p of desk.purchases.values()) {
     if (p.status === "pending") void watchPurchase(p.id);
