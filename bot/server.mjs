@@ -581,30 +581,53 @@ function paidStatus(st) {
   return ["completed", "complete", "success", "paid", "confirmed"].includes(String(st || "").toLowerCase());
 }
 
+function isPaid(pay) {
+  if (!pay) return false;
+  if (pay.completedAt) return true;
+  return paidStatus(pay.status);
+}
+
+function isFazerCancelled(pay) {
+  if (!pay || isPaid(pay)) return false;
+  const st = String(pay.status || "").toLowerCase();
+  return st === "cancelled" || st === "canceled" || Boolean(pay.cancelledAt);
+}
+
 async function tryConfirmFromFazer(depositId) {
   const d = desk.deposits.get(depositId);
   if (!d) return "Not found";
   if (d.status === "credited") return "Already credited";
-  if (d.status === "cancelled") return "Closed";
   if (!fazerConfigured()) return d.status;
   try {
     const pay = await getPayment(d.id);
     if (!pay) return d.status;
-    if (paidStatus(pay.status)) {
-      const credited = exactUsdt(pay.creditAmount) || d.payAmount;
+    if (isPaid(pay)) {
+      const credited = payLabel(pay.creditAmount) || payLabel(pay.sendAmount) || d.payAmount;
       if (credited) d.creditCents = centsOf(credited);
-      d.status = "checking";
+      if (d.status === "cancelled") d.status = "checking";
       return creditDeposit(depositId);
     }
-    if (["cancelled", "canceled", "expired", "failed"].includes(pay.status)) {
+    if (isFazerCancelled(pay)) {
+      const was = d.status;
       d.status = "cancelled";
       await save({ deposits: [d] });
+      if (was !== "cancelled" && bot) {
+        try {
+          await bot.api.sendMessage(
+            d.chatId,
+            `${d.id} expired. Nothing was added. Tap Deposit to try again.`,
+            { reply_markup: homeKb() },
+          );
+        } catch {
+          /* ignore */
+        }
+      }
       return "cancelled";
     }
   } catch (err) {
     console.error("payment poll failed", err instanceof Error ? err.message : err);
   }
-  return d.status;
+  return "waiting";
 }
 
 async function watchPayment(depositId) {
@@ -613,16 +636,18 @@ async function watchPayment(depositId) {
   try {
     while (true) {
       const d = desk.deposits.get(depositId);
-      if (!d || d.status === "credited" || d.status === "cancelled") return;
+      if (!d || d.status === "credited") return;
       const st = await tryConfirmFromFazer(depositId);
-      if (["Credited", "Already credited", "Closed", "cancelled", "Not found"].includes(st)) return;
-      const slow = d.expiresAt && Date.now() > d.expiresAt + 10 * 60 * 1000;
-      await new Promise((r) => setTimeout(r, slow ? 30000 : 8000));
+      if (["Credited", "Already credited", "Not found"].includes(st)) return;
+      if (st === "cancelled") return;
+      const slow = d.expiresAt && Date.now() > d.expiresAt + 2 * 60 * 60 * 1000;
+      await new Promise((r) => setTimeout(r, slow ? 30000 : 4000));
     }
   } finally {
     watching.delete(depositId);
   }
 }
+
 
 async function startDeposit(ctx, baseUsdt, method = "bep20") {
   const amount = exactUsdt(baseUsdt);
@@ -672,10 +697,7 @@ async function startDeposit(ctx, baseUsdt, method = "bep20") {
   sessionOf(ctx.chat.id).screen = "pay";
   sessionOf(ctx.chat.id).depositId = deposit.id;
   await save({ deposits: [deposit] });
-  const kb = new InlineKeyboard()
-    .text("I’ve paid", `paid:${deposit.id}`)
-    .row()
-    .text("Cancel", `cancel:${deposit.id}`);
+  const kb = new InlineKeyboard().text("I’ve paid", `paid:${deposit.id}`);
   const lines = [
     `Send exactly ${send} USDT`,
     `Network: ${networkMeta(method).label}`,
@@ -700,12 +722,10 @@ async function creditDeposit(depositId) {
   const d = desk.deposits.get(depositId);
   if (!d) return "Not found";
   if (d.status === "credited") return "Already credited";
-  if (d.status === "cancelled") return "Closed";
-  if (d.status !== "awaiting" && d.status !== "checking") return "Closed";
-  if (!fazerConfigured()) return "Closed";
+  if (!fazerConfigured()) return d.status;
   try {
     const pay = await getPayment(d.id);
-    if (!pay || !paidStatus(pay.status)) return d.status;
+    if (!pay || !isPaid(pay)) return d.status;
     const credited = payLabel(pay.creditAmount) || payLabel(pay.sendAmount) || d.payAmount;
     if (credited) d.creditCents = centsOf(credited);
   } catch (err) {
@@ -1311,10 +1331,6 @@ if (bot) {
       await ctx.answerCallbackQuery({ text: "Already credited" });
       return;
     }
-    if (d.status === "cancelled") {
-      await ctx.answerCallbackQuery({ text: "Closed" });
-      return;
-    }
     await ctx.answerCallbackQuery({ text: "Checking…" });
     const st = await tryConfirmFromFazer(id);
     if (st === "Credited" || st === "Already credited") {
@@ -1531,7 +1547,7 @@ server.listen(PORT, "0.0.0.0", async () => {
   await loadDesk();
   await zeroBalancesOnce();
   for (const d of desk.deposits.values()) {
-    if (d.status === "awaiting" || d.status === "checking") void watchPayment(d.id);
+    if (d.status !== "credited") void watchPayment(d.id);
   }
   for (const p of desk.purchases.values()) {
     if (p.status === "pending") void watchPurchase(p.id);

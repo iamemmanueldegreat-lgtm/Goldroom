@@ -302,6 +302,8 @@ export function normalizePayment(raw) {
     creditAmount: String(amount || unique || ""),
     status: String(p.status || "pending").toLowerCase(),
     expiresAt: p.expiresAt || p.expires_at || null,
+    completedAt: p.completedAt || p.completed_at || null,
+    cancelledAt: p.cancelledAt || p.cancelled_at || null,
     network: p.network || "BEP20",
     memo: p.memo || p.tag || "",
     raw: p,
