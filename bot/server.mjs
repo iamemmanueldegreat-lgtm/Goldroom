@@ -523,6 +523,44 @@ function isAdmin(ctx) {
   return ADMIN_ID > 0 && ctx.from?.id === ADMIN_ID;
 }
 
+function parseAdminBalanceArgs(ctx, cmd, { allowZero = false } = {}) {
+  const parts = (ctx.match || "").trim().split(/\s+/);
+  const who = parts[0] || "";
+  const amount = Number(parts[1]);
+  const okAmt = Number.isFinite(amount) && (allowZero ? amount >= 0 : amount > 0);
+  if (!who || !okAmt) {
+    const sample = cmd === "set" ? "10.00" : "5.00";
+    ctx.reply(`Usage: /${cmd} 123456789 ${sample}\nNumeric Telegram id from /users, then USDT.`);
+    return null;
+  }
+  const chatId = Number(who.replace(/^@/, ""));
+  if (!chatId) {
+    ctx.reply("Use the numeric Telegram id from /users.");
+    return null;
+  }
+  const user = ensureUser(chatId, desk.users.get(chatId)?.username || "");
+  return { chatId, user, cents: centsOf(amount.toFixed(2)), amount };
+}
+
+async function applyAdminBalance(ctx, chatId, nextCents, action) {
+  const user = ensureUser(chatId, desk.users.get(chatId)?.username || "");
+  const before = user.balanceCents;
+  user.balanceCents = Math.max(0, Math.round(nextCents));
+  await save({ users: [user] });
+  await ctx.reply(
+    `${user.username ? "@" + user.username : "user"} ${chatId}\n${money(before)} → ${money(user.balanceCents)} USDT (${action})`,
+  );
+  try {
+    await bot.api.sendMessage(
+      chatId,
+      `Your Goldroom balance is now ${money(user.balanceCents)} USDT.`,
+      { reply_markup: homeKb() },
+    );
+  } catch {
+    /* user may not have started */
+  }
+}
+
 async function expireStale() {
   /* Keep invoices open until the payment is confirmed or the supplier expires them. */
 }
@@ -1161,6 +1199,8 @@ if (bot) {
         "/price 25 29.50 — set sell price",
         "/users — customer balances",
         "/credit 123456789 25 — add USDT",
+        "/debit 123456789 5 — take USDT off",
+        "/set 123456789 10 — set their balance",
         "/unlock 123456789 — clear a stuck card (no refund)",
         "/catalog — supplier offers",
         "/fz — latest supplier orders",
@@ -1245,33 +1285,30 @@ if (bot) {
       await ctx.reply("Not for buyers.");
       return;
     }
-    const parts = (ctx.match || "").trim().split(/\s+/);
-    const who = parts[0];
-    const amount = Number(parts[1]);
-    if (!who || !Number.isFinite(amount) || amount <= 0) {
-      await ctx.reply("Usage: /credit 123456789 25.00\nNumeric Telegram id, then USDT.");
-      return;
-    }
-    const chatId = Number(who.replace(/^@/, ""));
-    if (!chatId) {
-      await ctx.reply("Use the numeric Telegram id from the deposit message.");
-      return;
-    }
-    const user = ensureUser(chatId, who);
-    user.balanceCents += centsOf(amount.toFixed(2));
-    await save({ users: [user] });
-    await ctx.reply(`Credited ${amount.toFixed(2)} USDT. Balance ${money(user.balanceCents)}.`);
-    try {
-      await bot.api.sendMessage(
-        chatId,
-        `Your account has been credited ${amount.toFixed(2)} USDT. Balance: ${money(user.balanceCents)} USDT.`,
-        { reply_markup: homeKb() },
-      );
-    } catch {
-      /* user may not have started */
-    }
+    const parsed = parseAdminBalanceArgs(ctx, "credit");
+    if (!parsed) return;
+    await applyAdminBalance(ctx, parsed.chatId, parsed.user.balanceCents + parsed.cents, "added");
   });
 
+  bot.command("debit", async (ctx) => {
+    if (!isAdmin(ctx)) {
+      await ctx.reply("Not for buyers.");
+      return;
+    }
+    const parsed = parseAdminBalanceArgs(ctx, "debit");
+    if (!parsed) return;
+    await applyAdminBalance(ctx, parsed.chatId, parsed.user.balanceCents - parsed.cents, "removed");
+  });
+
+  bot.command("set", async (ctx) => {
+    if (!isAdmin(ctx)) {
+      await ctx.reply("Not for buyers.");
+      return;
+    }
+    const parsed = parseAdminBalanceArgs(ctx, "set", { allowZero: true });
+    if (!parsed) return;
+    await applyAdminBalance(ctx, parsed.chatId, parsed.cents, "set");
+  });
 
   bot.command("unlock", async (ctx) => {
     if (!isAdmin(ctx)) {
