@@ -91,51 +91,61 @@ export async function fazerBalance() {
   };
 }
 
+function scoreCategory(h) {
+  const blob = `${h.name || ""} ${h.category_id || ""}`.toLowerCase();
+  let score = 1;
+  if (/\bus\b|usd|united|usa/.test(blob)) score += 5;
+  if (/gold/.test(blob)) score += 2;
+  if (/pin|gift/.test(blob)) score += 1;
+  return score;
+}
+
 async function listGiftcardHits() {
   const hits = [];
   if (FORCED_CATEGORY) return hits;
   let n = 0;
-  for await (const it of client.giftcards.iterCategories({ limit: 50 })) {
+  for await (const it of client.giftcards.iterCategories({ limit: 100 })) {
     n += 1;
     const name = `${it.name || ""} ${it.category_id || ""}`;
     if (/razer/i.test(name)) hits.push(it);
     const blob = name.toLowerCase();
     if (/razer/.test(blob) && /gold/.test(blob) && /\bus\b|usd|united|usa/.test(blob)) break;
-    if (n >= 12) break;
+    if (n >= 80) break;
   }
   return hits;
 }
 
-function pickCategory(hits) {
-  if (FORCED_CATEGORY) return FORCED_CATEGORY;
-  const scored = hits.map((h) => {
-    const blob = `${h.name || ""} ${h.category_id || ""}`.toLowerCase();
-    let score = 1;
-    if (/\bus\b|usd|united|usa/.test(blob)) score += 5;
-    if (/gold/.test(blob)) score += 2;
-    if (/pin|gift/.test(blob)) score += 1;
-    return { id: h.category_id, score, name: h.name };
-  });
-  scored.sort((a, b) => b.score - a.score);
-  return scored[0]?.id || "";
-}
-
-export async function razerCatalog(force = false) {
+export async function razerCatalog(force = false, denom = 0) {
   const now = Date.now();
-  if (!force && now - cache.at < 10 * 60 * 1000 && cache.offers.length && cache.categoryId) return cache;
-  const hits = await listGiftcardHits();
-  const categoryId = pickCategory(hits);
-  if (!categoryId) {
-    cache = { at: now, categoryId: "", offers: [], hits };
+  if (
+    !force &&
+    now - cache.at < 10 * 60 * 1000 &&
+    cache.offers.length &&
+    cache.categoryId &&
+    (!denom || matchOffer(cache.offers, denom))
+  ) {
     return cache;
   }
-  const data = await client.giftcards.cards(categoryId);
-  cache = {
-    at: now,
-    categoryId,
-    offers: data.offers || [],
-    hits,
-  };
+  const hits = await listGiftcardHits();
+  const ranked = [...hits].sort((a, b) => scoreCategory(b) - scoreCategory(a));
+  if (FORCED_CATEGORY) ranked.unshift({ category_id: FORCED_CATEGORY, name: FORCED_CATEGORY });
+  let chosen = { at: now, categoryId: "", offers: [], hits };
+  for (const h of ranked.slice(0, 12)) {
+    if (!h?.category_id) continue;
+    const data = await client.giftcards.cards(h.category_id);
+    const offers = data.offers || data.items || [];
+    const ok = denom
+      ? Boolean(matchOffer(offers, denom))
+      : [10, 20, 25, 50, 100].some((d) => matchOffer(offers, d));
+    if (offers.length) {
+      chosen = { at: now, categoryId: h.category_id, offers, hits };
+      if (ok) {
+        cache = chosen;
+        return cache;
+      }
+    }
+  }
+  cache = chosen;
   return cache;
 }
 
@@ -174,10 +184,10 @@ function pinFrom(order, fallbackId, costUsd, offerName, categoryId) {
 }
 
 export async function buyRazerPin(denom, idem) {
-  let cat = await razerCatalog();
+  let cat = await razerCatalog(false, denom);
   let offer = matchOffer(cat.offers, denom);
   if (!offer) {
-    cat = await razerCatalog(true);
+    cat = await razerCatalog(true, denom);
     offer = matchOffer(cat.offers, denom);
   }
   if (!cat.categoryId) {
@@ -201,6 +211,7 @@ export async function buyRazerPin(denom, idem) {
   } catch (err) {
     const e = new Error(err instanceof Error ? err.message : String(err));
     e.code = "NO_OFFER";
+    e.status = err.status;
     throw e;
   }
   const orderId = order?.id;
