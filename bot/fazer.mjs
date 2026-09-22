@@ -266,14 +266,14 @@ export async function methodLimits(code = "bep20") {
     const hit =
       items.find((m) => String(m.code || "").toLowerCase() === want) ||
       items.find((m) => new RegExp(want, "i").test(`${m.code || ""} ${m.label || ""}`));
-    if (!hit) return { min: 10, max: 50000, code: want };
+    if (!hit) return { min: 3, max: 50000, code: want };
     return {
       code: hit.code || want,
-      min: Number(hit.minAmountUsd ?? 10) || 10,
+      min: Number(hit.minAmountUsd ?? hit.min_amount ?? 3) || 3,
       max: Number(hit.maxAmountUsd ?? 50000) || 50000,
     };
   } catch {
-    return { min: 10, max: 50000, code: want };
+    return { min: 3, max: 50000, code: want };
   }
 }
 

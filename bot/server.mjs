@@ -25,10 +25,11 @@ const ALLOWLIST = (process.env.ALLOWLIST || "")
   .map((s) => s.replace(/^@/, "").toLowerCase())
   .filter(Boolean);
 const PORT = Number(process.env.PORT || 3000);
-const ORDER_TTL_MS = 30 * 60 * 1000;
+const ORDER_TTL_MS = 20 * 60 * 1000;
 const DEFAULT_PRICES = { 10: 11.5, 20: 22.8, 25: 28.2, 50: 55.5, 100: 109 };
 const DENOMS = [10, 20, 25, 50, 100];
-const DEPOSITS = [10, 25, 50, 100, 200];
+const DEPOSITS = [3, 10, 25, 50, 100, 200];
+const DEPOSIT_MIN_USDT = 3;
 const PAY_NETWORKS = [
   { code: "bep20", label: "USDT · BEP20", chain: "BEP20" },
   { code: "aptos", label: "USDT · Aptos", chain: "Aptos" },
@@ -386,7 +387,7 @@ function supportFaq(text, chatId) {
     return "We don't see an open order. Use Deposit to add funds, then Buy Razer Gold.";
   }
   if (t === "deposit help" || /how.*deposit|deposit.*work|send.*usdt|which network|bep20|aptos/.test(t)) {
-    return "How to deposit\n\n1. Tap Deposit and enter an amount.\n2. Choose BEP20 or Aptos.\n3. Send the exact USDT amount shown. Network fees are paid from your wallet.\n4. Your Goldroom balance updates after confirmation.\n\nUse only the network printed on that deposit.";
+    return "How to deposit\n\nMinimum is 3.00 USDT. Each invoice is open for 20 minutes.\n\n1. Tap Deposit and enter an amount (3.00 or more).\n2. Choose BEP20 or Aptos.\n3. Send the exact USDT amount shown before the timer ends. Network fees are paid from your wallet.\n4. Your Goldroom balance updates after confirmation.\n\nUse only the network printed on that deposit.";
   }
   if (t === "buy a card" || /how.*buy|buy.*card|purchase|price/.test(t)) {
     return "How to buy\n\n1. Deposit USDT so you have a Goldroom balance.\n2. Tap Buy Razer Gold and choose an amount you can afford.\n3. Confirm. Your PIN arrives in this chat and as a .txt file.";
@@ -406,7 +407,7 @@ function supportFaq(text, chatId) {
     return "Most deposits credit automatically after the network confirms. Time varies by network. If a deposit is taking longer than usual, a specialist will review it.";
   }
   if (/minimum|min deposit/.test(t)) {
-    return "Type the amount you want, then pick a network. If the amount is below that network's minimum, we'll tell you the minimum before you send.";
+    return "Minimum deposit is 3.00 USDT. Each invoice stays open for 20 minutes. Type 3 or more, pick a network, and send the exact amount before the timer ends.";
   }
   return undefined;
 }
@@ -445,7 +446,7 @@ async function escalateSupport(ctx, text) {
 async function openHelp(ctx) {
   sessionOf(ctx.chat.id).screen = "support";
   await ctx.reply(
-    "Buy Razer Gold US in three steps.\n\n1. Deposit USDT on BEP20 or Aptos — send the exact amount shown.\n2. When your balance updates, tap Buy Razer Gold.\n3. Your PIN arrives in this chat.\n\nRedeem at gold.razer.com → Reload → Razer Gold PIN.\nCodes are final once revealed.\n\nNeed more help? Pick a topic or type a question.",
+    "Buy Razer Gold US in three steps.\n\n1. Deposit USDT on BEP20 or Aptos (minimum 3.00 USDT). Each invoice is open for 20 minutes — send the exact amount shown.\n2. When your balance updates, tap Buy Razer Gold.\n3. Your PIN arrives in this chat.\n\nRedeem at gold.razer.com → Reload → Razer Gold PIN.\nCodes are final once revealed.\n\nNeed more help? Pick a topic or type a question.",
     { reply_markup: supportKb() },
   );
 }
@@ -669,6 +670,70 @@ async function watchPayment(depositId) {
 }
 
 
+function remainLabel(expiresAt) {
+  const ms = Math.max(0, (expiresAt || 0) - Date.now());
+  const m = Math.floor(ms / 60000);
+  const sec = Math.floor((ms % 60000) / 1000);
+  return `${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
+}
+
+function depositInvoiceText(d, method, address, memo) {
+  const lines = [
+    `Minimum deposit: ${Number(DEPOSIT_MIN_USDT).toFixed(2)} USDT`,
+    `Send exactly ${d.payAmount} USDT`,
+    `Network: ${networkMeta(method).label}`,
+    `Time left: ${remainLabel(d.expiresAt)}`,
+    `Deposit: ${d.id}`,
+    "",
+    "To:",
+    `\`${address}\``,
+  ];
+  if (memo) lines.push("", `Memo: \`${memo}\``);
+  lines.push(
+    "",
+    "Send this amount before the timer ends. Network fees on your wallet are paid by you.",
+    "Your balance updates automatically after confirmation.",
+  );
+  return lines.join("\n");
+}
+
+async function runDepositClock(depositId, chatId, messageId, method, address, memo) {
+  if (!bot || !messageId) return;
+  while (true) {
+    const d = desk.deposits.get(depositId);
+    if (!d || d.status === "credited" || d.status === "cancelled") return;
+    const left = (d.expiresAt || 0) - Date.now();
+    const kb = new InlineKeyboard().text("I’ve paid", `paid:${d.id}`);
+    if (left <= 0) {
+      try {
+        await bot.api.editMessageText(
+          chatId,
+          messageId,
+          `Time is up for ${d.id}.\n\nIf you already sent USDT, tap I’ve paid. Otherwise tap Deposit for a new invoice.`,
+          { reply_markup: kb },
+        );
+      } catch {
+        /* ignore */
+      }
+      return;
+    }
+    const body = depositInvoiceText(d, method, address, memo);
+    try {
+      await bot.api.editMessageText(chatId, messageId, body, {
+        parse_mode: "Markdown",
+        reply_markup: kb,
+      });
+    } catch {
+      try {
+        await bot.api.editMessageText(chatId, messageId, body.replace(/`/g, ""), { reply_markup: kb });
+      } catch {
+        /* ignore */
+      }
+    }
+    await new Promise((r) => setTimeout(r, Math.min(30_000, Math.max(5_000, left))));
+  }
+}
+
 async function startDeposit(ctx, baseUsdt, method = "bep20") {
   const amount = exactUsdt(baseUsdt);
   if (!amount) {
@@ -718,24 +783,17 @@ async function startDeposit(ctx, baseUsdt, method = "bep20") {
   sessionOf(ctx.chat.id).depositId = deposit.id;
   await save({ deposits: [deposit] });
   const kb = new InlineKeyboard().text("I’ve paid", `paid:${deposit.id}`);
-  const lines = [
-    `Send exactly ${send} USDT`,
-    `Network: ${networkMeta(method).label}`,
-    `Deposit: ${deposit.id}`,
-    "",
-    "To:",
-    `\`${pay.address}\``,
-  ];
-  if (pay.memo) {
-    lines.push("", `Memo: \`${pay.memo}\``);
-  }
-  lines.push("", "Send this amount. Network fees on your wallet are paid by you.", "Your balance updates automatically after confirmation.");
+  const body = depositInvoiceText(deposit, method, pay.address, pay.memo);
+  let messageId;
   try {
-    await ctx.reply(lines.join("\n"), { parse_mode: "Markdown", reply_markup: kb });
+    const sent = await ctx.reply(body, { parse_mode: "Markdown", reply_markup: kb });
+    messageId = sent.message_id;
   } catch {
-    await ctx.reply(lines.join("\n").replace(/`/g, ""), { reply_markup: kb });
+    const sent = await ctx.reply(body.replace(/`/g, ""), { reply_markup: kb });
+    messageId = sent.message_id;
   }
   void watchPayment(deposit.id);
+  void runDepositClock(deposit.id, ctx.chat.id, messageId, method, pay.address, pay.memo);
 }
 
 async function creditDeposit(depositId) {
@@ -1012,7 +1070,7 @@ if (bot) {
 
   bot.command("help", async (ctx) => {
     await ctx.reply(
-      "Buy Razer Gold US in three steps.\n\n1. Deposit USDT on BEP20 or Aptos — send the exact amount shown.\n2. When your balance updates, tap Buy Razer Gold.\n3. Your PIN arrives in this chat.\n\nRedeem at gold.razer.com → Reload → Razer Gold PIN.\nCodes are final once revealed.\n\nNeed more help? Pick a topic or type a question.",
+      "Buy Razer Gold US in three steps.\n\n1. Deposit USDT on BEP20 or Aptos (minimum 3.00 USDT). Each invoice is open for 20 minutes — send the exact amount shown.\n2. When your balance updates, tap Buy Razer Gold.\n3. Your PIN arrives in this chat.\n\nRedeem at gold.razer.com → Reload → Razer Gold PIN.\nCodes are final once revealed.\n\nNeed more help? Pick a topic or type a question.",
       { reply_markup: supportKb() },
     );
     sessionOf(ctx.chat.id).screen = "support";
@@ -1494,7 +1552,7 @@ if (bot) {
     if (/^deposit$/i.test(text)) {
       sess.screen = "deposit";
       await ctx.reply(
-        "Choose a deposit amount, or type one — for example 24.8 or 10.\n\nThen pick BEP20 or Aptos. Network fees are paid from your wallet. Your balance updates after confirmation.",
+        "Minimum deposit: 3.00 USDT\nEach invoice is open for 20 minutes.\n\nChoose an amount, or type one — for example 3 or 24.8.\n\nThen pick BEP20 or Aptos. Network fees are paid from your wallet. Send before the timer ends. Your balance updates after confirmation.",
         { reply_markup: depositKb() },
       );
       return;
