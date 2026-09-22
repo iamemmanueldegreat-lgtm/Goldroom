@@ -13,6 +13,8 @@ import {
   extractCodes,
   listRecentOrders,
   waitFazerOrder,
+  setForcedCategory,
+  getForcedCategory,
 } from "./fazer.mjs";
 
 const TOKEN = (process.env.TELEGRAM_BOT_TOKEN || "").trim();
@@ -1203,6 +1205,7 @@ if (bot) {
         "/set 123456789 10 — set their balance",
         "/unlock 123456789 — clear a stuck card (no refund)",
         "/catalog — supplier offers",
+        "/catid ID — lock Razer category id",
         "/fz — latest supplier orders",
         "/fz ord-123 — pull that order / PIN",
       ].join("\n"),
@@ -1262,21 +1265,58 @@ if (bot) {
       return;
     }
     try {
-      const cat = await razerCatalog();
+      const cat = await razerCatalog(true);
       if (!cat.categoryId) {
-        const names = cat.hits.map((h) => `${h.category_id}  ·  ${h.name}`).join("\n") || "none";
-        await ctx.reply(`No Razer category matched.\nHits:\n${names}\n\nSet FAZER_CATEGORY_ID.`);
+        const razer = (cat.hits || []).map((h) => `${h.category_id}  ·  ${h.name}`).join("\n") || "none";
+        const sample = (cat.all || []).slice(0, 30).map((h) => `${h.category_id}  ·  ${h.name}`).join("\n") || "none";
+        await ctx.reply(
+          [
+            "No Razer Gold US category locked yet.",
+            `Forced id: ${getForcedCategory() || "not set"}`,
+            `Gift-card categories seen: ${(cat.all || []).length}`,
+            "",
+            "Razer / gold hits:",
+            razer,
+            "",
+            "First categories:",
+            sample,
+            "",
+            "On the supplier site open Razer Gold US and copy the category id.",
+            "Then send: /catid THE_ID",
+            "Or add FAZER_CATEGORY_ID in Railway.",
+          ].join("\n"),
+        );
         return;
       }
       const lines = DENOMS.map((d) => {
         const o = matchOffer(cat.offers, d);
         return o
-          ? `$${d}  ·  ${o.card_id}  ·  ${o.price_usd || o.price} USD`
+          ? `$${d}  ·  ${o.card_id}  ·  ${o.price_usd || o.price} USD  ·  stock ${o.stock ?? "?"}`
           : `$${d}  ·  no offer`;
       }).join("\n");
-      await ctx.reply(`Fazer category: ${cat.categoryId}\n${lines}`);
+      await ctx.reply(`Category: ${cat.categoryId}\n${lines}\n\nChange with /catid CATEGORY_ID`);
     } catch (err) {
-      await ctx.reply(`Fazer catalog failed: ${err.message || err}`);
+      await ctx.reply(`Catalog failed: ${err.message || err}`);
+    }
+  });
+
+  bot.command("catid", async (ctx) => {
+    if (!isAdmin(ctx)) {
+      await ctx.reply("Not for buyers.");
+      return;
+    }
+    const id = (ctx.match || "").trim().split(/\s+/)[0];
+    if (!id) {
+      await ctx.reply(`Current: ${getForcedCategory() || "not set"}\nUsage: /catid category_id`);
+      return;
+    }
+    setForcedCategory(id);
+    try {
+      const cat = await razerCatalog(true);
+      const n = (cat.offers || []).length;
+      await ctx.reply(`Using ${getForcedCategory()}\nOffers: ${n}\nSend /catalog to verify.`);
+    } catch (err) {
+      await ctx.reply(`Saved ${id} but offers failed: ${err.message || err}`);
     }
   });
 

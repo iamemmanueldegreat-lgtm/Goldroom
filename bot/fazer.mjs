@@ -97,22 +97,36 @@ function scoreCategory(h) {
   if (/\bus\b|usd|united|usa/.test(blob)) score += 5;
   if (/gold/.test(blob)) score += 2;
   if (/pin|gift/.test(blob)) score += 1;
+  if (/razer|rzr/.test(blob)) score += 6;
   return score;
 }
 
-async function listGiftcardHits() {
-  const hits = [];
-  if (FORCED_CATEGORY) return hits;
+let forcedCategory = FORCED_CATEGORY;
+
+export function setForcedCategory(id) {
+  forcedCategory = String(id || "").trim();
+  cache = { at: 0, categoryId: "", offers: [], hits: [] };
+}
+
+export function getForcedCategory() {
+  return forcedCategory;
+}
+
+async function listAllGiftcardCategories() {
+  const all = [];
   let n = 0;
   for await (const it of client.giftcards.iterCategories({ limit: 100 })) {
+    all.push(it);
     n += 1;
-    const name = `${it.name || ""} ${it.category_id || ""}`;
-    if (/razer/i.test(name)) hits.push(it);
-    const blob = name.toLowerCase();
-    if (/razer/.test(blob) && /gold/.test(blob) && /\bus\b|usd|united|usa/.test(blob)) break;
-    if (n >= 80) break;
+    if (n >= 2000) break;
   }
-  return hits;
+  return all;
+}
+
+async function listGiftcardHits() {
+  const all = await listAllGiftcardCategories();
+  const hits = all.filter((it) => /razer|rzr|gold/i.test(`${it.name || ""} ${it.category_id || ""}`));
+  return { hits, all };
 }
 
 export async function razerCatalog(force = false, denom = 0) {
@@ -126,11 +140,11 @@ export async function razerCatalog(force = false, denom = 0) {
   ) {
     return cache;
   }
-  const hits = await listGiftcardHits();
+  const { hits, all } = forcedCategory ? { hits: [], all: [] } : await listGiftcardHits();
   const ranked = [...hits].sort((a, b) => scoreCategory(b) - scoreCategory(a));
-  if (FORCED_CATEGORY) ranked.unshift({ category_id: FORCED_CATEGORY, name: FORCED_CATEGORY });
-  let chosen = { at: now, categoryId: "", offers: [], hits };
-  for (const h of ranked.slice(0, 12)) {
+  if (forcedCategory) ranked.unshift({ category_id: forcedCategory, name: forcedCategory });
+  let chosen = { at: now, categoryId: "", offers: [], hits, all };
+  for (const h of ranked.slice(0, 15)) {
     if (!h?.category_id) continue;
     const data = await client.giftcards.cards(h.category_id);
     const offers = data.offers || data.items || [];
@@ -138,7 +152,7 @@ export async function razerCatalog(force = false, denom = 0) {
       ? Boolean(matchOffer(offers, denom))
       : [10, 20, 25, 50, 100].some((d) => matchOffer(offers, d));
     if (offers.length) {
-      chosen = { at: now, categoryId: h.category_id, offers, hits };
+      chosen = { at: now, categoryId: h.category_id, offers, hits, all };
       if (ok) {
         cache = chosen;
         return cache;
