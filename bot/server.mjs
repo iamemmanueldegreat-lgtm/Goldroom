@@ -1122,6 +1122,11 @@ if (bot) {
     await ctx.reply("Reply mode off.");
   });
 
+  bot.command("ping", async (ctx) => {
+    if (!isAdmin(ctx)) return;
+    await ctx.reply("Goldroom ok");
+  });
+
   bot.command("reply", async (ctx) => {
     if (!isAdmin(ctx)) {
       await ctx.reply("Not for buyers.");
@@ -1208,6 +1213,7 @@ if (bot) {
         "/catid ID — lock Razer category id",
         "/fz — latest supplier orders",
         "/fz ord-123 — pull that order / PIN",
+        "/ping — deploy check",
       ].join("\n"),
     );
   });
