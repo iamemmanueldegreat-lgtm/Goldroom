@@ -70,6 +70,10 @@ function nid(prefix) {
   return `${prefix}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function nextId() {
   const id = `GR-${String(1000 + desk.seq)}`;
   desk.seq += 1;
@@ -291,17 +295,17 @@ function isLegacyDeposit(d) {
 }
 
 async function resetLedgerOnce() {
-  let done = false;
-  if (db) {
-    try {
-      const { data, error } = await db.from("goldroom_meta").select("value").eq("key", "ledger_reset_v4");
-      if (error) throw error;
-      if (data && data.length) done = true;
-    } catch (err) {
-      console.error("ledger reset flag read failed", err.message || err);
-    }
+  if (!db || !desk.ready) return;
+  let seen = false;
+  try {
+    const { data, error } = await db.from("goldroom_meta").select("value").eq("key", "ledger_reset_v4");
+    if (error) throw error;
+    seen = Boolean(data && data.length);
+  } catch (err) {
+    console.error("ledger reset skipped; flag unreadable", err.message || err);
+    return;
   }
-  if (done) return;
+  if (seen) return;
   desk.depositCutoff = Date.now();
   for (const p of desk.purchases.values()) {
     if (p.status === "pending") p.status = "failed";
@@ -673,20 +677,26 @@ async function tryConfirmFromFazer(depositId) {
       d.status = "cancelled";
       await save({ deposits: [d] });
       if (was !== "cancelled" && bot && !desk.bootQuiet) {
-        try {
-          await bot.api.sendMessage(
-            d.chatId,
-            `${d.id} expired. Nothing was added. Tap Deposit to try again.`,
-            { reply_markup: homeKb() },
-          );
-        } catch {
-          /* ignore */
+        const expiredAgo = Date.now() - (d.expiresAt || d.createdAt || 0);
+        if (expiredAgo < 2 * 60 * 60 * 1000) {
+          try {
+            await bot.api.sendMessage(
+              d.chatId,
+              `${d.id} expired. Nothing was added. Tap Deposit to try again.`,
+              { reply_markup: homeKb() },
+            );
+          } catch {
+            /* ignore */
+          }
         }
       }
       return "cancelled";
     }
   } catch (err) {
     console.error("payment poll failed", err instanceof Error ? err.message : err);
+    const status = Number(err?.status || err?.statusCode || 0);
+    const msg = err instanceof Error ? err.message : String(err);
+    if (status === 429 || /429|rate limit/i.test(msg)) return "rate";
   }
   return "waiting";
 }
@@ -699,13 +709,42 @@ async function watchPayment(depositId) {
       const d = desk.deposits.get(depositId);
       if (!d || d.status === "credited" || isLegacyDeposit(d)) return;
       const st = await tryConfirmFromFazer(depositId);
-      if (["Credited", "Already credited", "Not found"].includes(st)) return;
-      if (st === "cancelled") return;
-      const slow = d.expiresAt && Date.now() > d.expiresAt + 2 * 60 * 60 * 1000;
-      await new Promise((r) => setTimeout(r, slow ? 30000 : 4000));
+      if (["Credited", "Already credited", "Not found", "cancelled"].includes(st)) return;
+      const age = Date.now() - (d.expiresAt || d.createdAt || 0);
+      if (age > 3 * 24 * 60 * 60 * 1000) return;
+      const wait = st === "rate" ? 60_000 : age > 6 * 60 * 60 * 1000 ? 10 * 60 * 1000 : age > 2 * 60 * 60 * 1000 ? 60_000 : 8_000;
+      await sleep(wait);
     }
   } finally {
     watching.delete(depositId);
+  }
+}
+
+let sweeping = false;
+
+async function sweepOldDeposits() {
+  if (sweeping || !desk.ready || !fazerConfigured()) return;
+  sweeping = true;
+  try {
+    const old = [...desk.deposits.values()]
+      .filter((d) => {
+        if (d.status !== "awaiting" && d.status !== "checking") return false;
+        if (isLegacyDeposit(d) || watching.has(d.id)) return false;
+        const age = Date.now() - (d.expiresAt || d.createdAt || 0);
+        return age > 2 * 60 * 60 * 1000 && age < 14 * 24 * 60 * 60 * 1000;
+      })
+      .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
+      .slice(0, 4);
+    for (const d of old) {
+      const st = await tryConfirmFromFazer(d.id);
+      if (st === "rate") {
+        await sleep(60_000);
+        return;
+      }
+      await sleep(1500);
+    }
+  } finally {
+    sweeping = false;
   }
 }
 
@@ -836,34 +875,42 @@ async function startDeposit(ctx, baseUsdt, method = "bep20") {
   void runDepositClock(deposit.id, ctx.chat.id, messageId, method, pay.address, pay.memo);
 }
 
+const crediting = new Set();
+
 async function creditDeposit(depositId) {
-  const d = desk.deposits.get(depositId);
-  if (!d) return "Not found";
-  if (d.status === "credited") return "Already credited";
-  if (isLegacyDeposit(d)) return "Closed";
-  if (!fazerConfigured()) return d.status;
+  if (crediting.has(depositId)) return "waiting";
+  crediting.add(depositId);
   try {
-    const pay = await getPayment(d.id);
-    if (!pay || !isPaid(pay)) return d.status;
-    const credited = payLabel(pay.creditAmount) || payLabel(pay.sendAmount) || d.payAmount;
-    if (credited) d.creditCents = centsOf(credited);
-  } catch (err) {
-    console.error("credit verify failed", err instanceof Error ? err.message : err);
-    return d.status;
+    const d = desk.deposits.get(depositId);
+    if (!d) return "Not found";
+    if (d.status === "credited") return "Already credited";
+    if (isLegacyDeposit(d)) return "Closed";
+    if (!fazerConfigured()) return d.status;
+    try {
+      const pay = await getPayment(d.id);
+      if (!pay || !isPaid(pay)) return d.status;
+      const credited = payLabel(pay.creditAmount) || payLabel(pay.sendAmount) || d.payAmount;
+      if (credited) d.creditCents = centsOf(credited);
+    } catch (err) {
+      console.error("credit verify failed", err instanceof Error ? err.message : err);
+      return d.status;
+    }
+    d.status = "credited";
+    const user = ensureUser(d.chatId, d.username);
+    user.balanceCents += d.creditCents;
+    d.creditedAt = Date.now();
+    await save({ users: [user], deposits: [d] });
+    if (bot && !desk.bootQuiet) {
+      await bot.api.sendMessage(
+        d.chatId,
+        `Deposit ${d.id} confirmed.\nBalance: ${money(user.balanceCents)} USDT\n\nYou can buy Razer Gold US now.`,
+        { reply_markup: homeKb() },
+      );
+    }
+    return "Credited";
+  } finally {
+    crediting.delete(depositId);
   }
-  d.status = "credited";
-  const user = ensureUser(d.chatId, d.username);
-  user.balanceCents += d.creditCents;
-  d.creditedAt = Date.now();
-  await save({ users: [user], deposits: [d] });
-  if (bot && !desk.bootQuiet) {
-    await bot.api.sendMessage(
-      d.chatId,
-      `Deposit ${d.id} confirmed.\nBalance: ${money(user.balanceCents)} USDT\n\nYou can buy Razer Gold US now.`,
-      { reply_markup: homeKb() },
-    );
-  }
-  return "Credited";
 }
 
 async function syncPurchase(purchase) {
@@ -989,19 +1036,25 @@ async function refundPurchase(purchase, reason) {
   await notifyAdmin(`Buy refunded ${purchase.id} @${user.username} $${purchase.denom}\n${reason}`);
 }
 
+const lastPurchaseSync = new Map();
+
 async function tickPendingBuys() {
-  if (tickingBuys) return;
+  if (tickingBuys || !desk.ready) return;
   tickingBuys = true;
   try {
     const pending = [...desk.purchases.values()].filter((p) => p.status === "pending");
     for (const purchase of pending) {
       const age = Date.now() - (purchase.createdAt || Date.now());
+      const every = age > 6 * 60 * 60 * 1000 ? 5 * 60 * 1000 : age > 10 * 60 * 1000 ? 60_000 : 0;
+      const seen = lastPurchaseSync.get(purchase.id) || 0;
+      if (every && Date.now() - seen < every) continue;
+      lastPurchaseSync.set(purchase.id, Date.now());
       if (!purchase.fazerOrderId) {
         if (age > 3 * 60 * 1000) await refundPurchase(purchase, "no supplier order");
         continue;
       }
       await syncPurchase(purchase);
-      await new Promise((r) => setTimeout(r, 1500));
+      await sleep(1500);
     }
   } finally {
     tickingBuys = false;
@@ -1093,6 +1146,12 @@ const bot = TOKEN ? new Bot(TOKEN) : null;
 
 if (bot) {
   bot.use(async (ctx, next) => {
+    if (db && !desk.ready) {
+      const text = ctx.message?.text || "";
+      if (isAdmin(ctx) && /^\/ping\b/.test(text)) return next();
+      await ctx.reply("Goldroom is reconnecting. Try again in a minute.");
+      return;
+    }
     if (ctx.from && !allowed(ctx) && !isAdmin(ctx)) {
       await ctx.reply("Goldroom is available to registered customers only.");
       return;
@@ -1737,15 +1796,67 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, "0.0.0.0", async () => {
   console.log(`goldroom health listening on ${PORT}`);
-  await loadDesk();
-  await resetLedgerOnce();
-  for (const d of desk.deposits.values()) {
-    if ((d.status === "awaiting" || d.status === "checking") && !isLegacyDeposit(d)) {
-      void watchPayment(d.id);
+  let resumed = false;
+  async function resumeOpenWork() {
+    if (resumed || !desk.ready) return;
+    resumed = true;
+    let n = 0;
+    for (const d of desk.deposits.values()) {
+      if (d.status !== "awaiting" && d.status !== "checking") continue;
+      if (isLegacyDeposit(d)) continue;
+      const age = Date.now() - (d.expiresAt || d.createdAt || 0);
+      if (age > 14 * 24 * 60 * 60 * 1000) continue;
+      if (age <= 36 * 60 * 60 * 1000) {
+        const id = d.id;
+        setTimeout(() => void watchPayment(id), n * 1200);
+        n += 1;
+      }
     }
+    await sweepOldDeposits();
+    const stale = [...desk.deposits.values()]
+      .filter((d) => {
+        if (d.status !== "awaiting" && d.status !== "checking") return false;
+        if (isLegacyDeposit(d) || watching.has(d.id)) return false;
+        const age = Date.now() - (d.expiresAt || d.createdAt || 0);
+        return age > 36 * 60 * 60 * 1000 && age < 14 * 24 * 60 * 60 * 1000;
+      })
+      .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
+      .slice(0, 20);
+    for (const d of stale) {
+      const st = await tryConfirmFromFazer(d.id);
+      if (st === "rate") {
+        await sleep(60_000);
+        break;
+      }
+      await sleep(1200);
+    }
+    void tickPendingBuys();
   }
-  void tickPendingBuys();
+  async function loadDeskUntilReady() {
+    if (!db) {
+      desk.ready = true;
+      return;
+    }
+    for (let i = 0; i < 5; i += 1) {
+      if (await loadDesk()) return;
+      await sleep(2000 * (i + 1));
+    }
+    console.error("supabase not ready — refusing orders until it loads");
+    void (async () => {
+      while (!desk.ready) {
+        await sleep(15000);
+        if (!(await loadDesk())) continue;
+        await resetLedgerOnce();
+        if (!bot || !desk.bootQuiet) await resumeOpenWork();
+      }
+    })();
+  }
+  await loadDeskUntilReady();
+  if (desk.ready) await resetLedgerOnce();
+  desk.bootQuiet = false;
   setInterval(() => void tickPendingBuys(), 20_000);
+  setInterval(() => void sweepOldDeposits(), 10 * 60 * 1000);
+  if (desk.ready) void resumeOpenWork();
   if (!bot) return;
   bot.start({
     onStart: async (info) => {
@@ -1763,7 +1874,7 @@ server.listen(PORT, "0.0.0.0", async () => {
       if (!WALLET_BEP20) console.warn("WALLET_USDT_BEP20 is not set");
       if (!ADMIN_ID) console.warn("ADMIN_TELEGRAM_ID is not set");
       if (!fazerConfigured()) console.warn("CARD_API_KEY is not set — buys cannot hit Fazer");
-      desk.bootQuiet = false;
+      if (desk.ready) await resumeOpenWork();
     },
   });
 });
