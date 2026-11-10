@@ -1142,9 +1142,26 @@ async function buyCard(ctx, denom) {
   }
 }
 
-if (!TOKEN) {
-  console.error("TELEGRAM_BOT_TOKEN is missing. Health will run; bot will not.");
+const MOVED = [
+  "Goldroom has moved to the website.",
+  "",
+  "This bot is retired. Deposits, card purchases, and chat support are no longer handled here.",
+  "",
+  "Buy at www.goldroomcards.store",
+  "Support: support@goldroomcards.store",
+  "",
+  "Already have a PIN? Redeem it at https://gold.razer.com",
+  "That link is Razer's own site. You use it to load a PIN into a Razer Gold wallet. www.goldroomcards.store is our shop, where you buy the card.",
+].join("\n");
+
+const ADMIN_CMD = /^\/(ping|reply|admin|prices|price|users|catalog|catid|credit|debit|set|unlock|fz)(?:@\w+)?(?:\s|$)/i;
+
+async function sendMoved(ctx) {
+  if (ctx.callbackQuery) await ctx.answerCallbackQuery().catch(() => {});
+  await ctx.reply(MOVED, { link_preview_options: { is_disabled: true } }).catch(() => {});
 }
+
+if (!TOKEN) console.error("TELEGRAM_BOT_TOKEN is missing. Health will run; bot will not.");
 
 const bot = (() => {
   if (!TOKEN) return null;
@@ -1158,17 +1175,9 @@ const bot = (() => {
 
 if (bot) {
   bot.use(async (ctx, next) => {
-    if (db && !desk.ready) {
-      const text = ctx.message?.text || "";
-      if (isAdmin(ctx) && /^\/ping\b/.test(text)) return next();
-      await ctx.reply("Goldroom is reconnecting. Try again in a minute.");
-      return;
-    }
-    if (ctx.from && !allowed(ctx) && !isAdmin(ctx)) {
-      await ctx.reply("Goldroom is available to registered customers only.");
-      return;
-    }
-    await next();
+    const text = ctx.message?.text || "";
+    if (isAdmin(ctx) && ADMIN_CMD.test(text)) return next();
+    await sendMoved(ctx);
   });
 
   bot.command("start", async (ctx) => {
@@ -1887,10 +1896,7 @@ async function runPolling() {
           console.log(`goldroom bot @${info.username} polling`);
           try {
             await bot.api.setMyCommands([
-              { command: "start", description: "Open Goldroom" },
-              { command: "help", description: "How to buy and get support" },
-              { command: "balance", description: "Your Goldroom balance" },
-              { command: "orders", description: "Your deposits and cards" },
+              { command: "start", description: "Goldroom has moved to the website" },
             ]);
           } catch (err) {
             console.warn("setMyCommands failed", err instanceof Error ? err.message : err);
