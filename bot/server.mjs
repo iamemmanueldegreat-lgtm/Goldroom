@@ -44,6 +44,10 @@ const db =
   SUPABASE_URL && SUPABASE_KEY
     ? createClient(SUPABASE_URL, SUPABASE_KEY, {
         auth: { persistSession: false, autoRefreshToken: false },
+        global: {
+          fetch: (url, opts = {}) =>
+            fetch(url, { ...opts, signal: AbortSignal.timeout(8000) }),
+        },
       })
     : null;
 
@@ -1142,7 +1146,15 @@ if (!TOKEN) {
   console.error("TELEGRAM_BOT_TOKEN is missing. Health will run; bot will not.");
 }
 
-const bot = TOKEN ? new Bot(TOKEN) : null;
+const bot = (() => {
+  if (!TOKEN) return null;
+  try {
+    return new Bot(TOKEN);
+  } catch (err) {
+    console.error("TELEGRAM_BOT_TOKEN was rejected", err instanceof Error ? err.message : err);
+    return null;
+  }
+})();
 
 if (bot) {
   bot.use(async (ctx, next) => {
@@ -1794,8 +1806,13 @@ const server = http.createServer((req, res) => {
   res.end("not found");
 });
 
-server.listen(PORT, "0.0.0.0", async () => {
+server.listen(PORT, "0.0.0.0", () => {
   console.log(`goldroom health listening on ${PORT}`);
+  if (bot) void runPolling();
+  void bootDesk().catch((err) => console.error("boot failed", err instanceof Error ? err.message : err));
+});
+
+async function bootDesk() {
   let resumed = false;
   async function resumeOpenWork() {
     if (resumed || !desk.ready) return;
@@ -1856,25 +1873,42 @@ server.listen(PORT, "0.0.0.0", async () => {
   desk.bootQuiet = false;
   setInterval(() => void tickPendingBuys(), 20_000);
   setInterval(() => void sweepOldDeposits(), 10 * 60 * 1000);
-  if (desk.ready) void resumeOpenWork();
-  if (!bot) return;
-  bot.start({
-    onStart: async (info) => {
-      console.log(`goldroom bot @${info.username} polling`);
+  if (desk.ready) {
+    void resumeOpenWork().catch((err) => console.error("resume failed", err instanceof Error ? err.message : err));
+  }
+}
+
+async function runPolling() {
+  while (bot) {
+    try {
+      await bot.api.deleteWebhook();
+      await bot.start({
+        onStart: async (info) => {
+          console.log(`goldroom bot @${info.username} polling`);
+          try {
+            await bot.api.setMyCommands([
+              { command: "start", description: "Open Goldroom" },
+              { command: "help", description: "How to buy and get support" },
+              { command: "balance", description: "Your Goldroom balance" },
+              { command: "orders", description: "Your deposits and cards" },
+            ]);
+          } catch (err) {
+            console.warn("setMyCommands failed", err instanceof Error ? err.message : err);
+          }
+          if (!WALLET_BEP20) console.warn("WALLET_USDT_BEP20 is not set");
+          if (!ADMIN_ID) console.warn("ADMIN_TELEGRAM_ID is not set");
+          if (!fazerConfigured()) console.warn("CARD_API_KEY is not set — buys cannot hit Fazer");
+        },
+      });
+      console.error("polling ended");
+    } catch (err) {
+      console.error("polling failed", err instanceof Error ? err.message : err);
       try {
-        await bot.api.setMyCommands([
-          { command: "start", description: "Open Goldroom" },
-          { command: "help", description: "How to buy and get support" },
-          { command: "balance", description: "Your Goldroom balance" },
-          { command: "orders", description: "Your deposits and cards" },
-        ]);
-      } catch (err) {
-        console.warn("setMyCommands failed", err instanceof Error ? err.message : err);
+        await bot.stop();
+      } catch {
+        /* not running */
       }
-      if (!WALLET_BEP20) console.warn("WALLET_USDT_BEP20 is not set");
-      if (!ADMIN_ID) console.warn("ADMIN_TELEGRAM_ID is not set");
-      if (!fazerConfigured()) console.warn("CARD_API_KEY is not set — buys cannot hit Fazer");
-      if (desk.ready) await resumeOpenWork();
-    },
-  });
-});
+    }
+    await sleep(5000);
+  }
+}
