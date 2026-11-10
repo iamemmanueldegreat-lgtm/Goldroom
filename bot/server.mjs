@@ -1151,7 +1151,7 @@ const MOVED = [
   "Support: support@goldroomcards.store",
   "",
   "Already have a PIN? Redeem it at https://gold.razer.com",
-  "That link is Razer's own site. You use it to load a PIN into a Razer Gold wallet. www.goldroomcards.store is our shop, where you buy the card.",
+  "Want to buy a PIN? Buy at www.goldroomcards.store",
 ].join("\n");
 
 const ADMIN_CMD = /^\/(ping|reply|admin|prices|price|users|catalog|catid|credit|debit|set|unlock|fz)(?:@\w+)?(?:\s|$)/i;
